@@ -195,10 +195,28 @@ app.post("/trade-plan", async (req, res) => {
         .join("")
         .trim()
         .replace(/^```json\s*|\s*```$/g, "");
-      return JSON.parse(raw);
+      if (!raw) {
+        console.error("Empty response from Claude for prompt starting:", prompt.slice(0, 50));
+        throw new Error("Claude returned an empty response for this image.");
+      }
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        console.error("Failed to parse JSON. Raw text was:", raw);
+        throw new Error("Could not parse a readable chain from that screenshot — it may not have shown a visible options table.");
+      }
     }
 
-    const chain = await extractJSON(chainImage, CHAIN_EXTRACT_PROMPT);
+    let chain;
+    try {
+      chain = await extractJSON(chainImage, CHAIN_EXTRACT_PROMPT);
+    } catch (e) {
+      return res.status(200).json({
+        error: "Could not read the options chain from that screenshot: " + e.message +
+               " Make sure the Sahm tab is showing the full options chain table (not just a summary page) before analyzing.",
+      });
+    }
+
     let chart = null;
     if (chartImage) {
       try {
