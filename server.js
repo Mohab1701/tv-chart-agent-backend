@@ -14,6 +14,13 @@ app.use(cors({ origin: ALLOWED_ORIGIN }));
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Logs every incoming request so Render's log view shows exactly what's
+// arriving, for debugging.
+app.use((req, res, next) => {
+  console.log("Incoming:", req.method, req.path);
+  next();
+});
+
 // ---- Black-Scholes engine (same math as the Options Strike & Expiry
 // Reader tool, ported so the server can rank strikes with real arithmetic
 // instead of asking the model to eyeball it) --------------------------------
@@ -118,6 +125,17 @@ app.post("/analyze", async (req, res) => {
 });
 
 app.get("/", (req, res) => res.send("TradingView chart agent backend is running."));
+
+app.get("/debug/routes", (req, res) => {
+  const routes = [];
+  app._router.stack.forEach((layer) => {
+    if (layer.route) {
+      const methods = Object.keys(layer.route.methods).join(",").toUpperCase();
+      routes.push(methods + " " + layer.route.path);
+    }
+  });
+  res.json({ routes });
+});
 
 const CHART_EXTRACT_PROMPT = `You are reading a TradingView chart screenshot for a
 trader using Smart Money Concepts (CHoCH, BOS, Fair Value Gaps, Order Blocks,
