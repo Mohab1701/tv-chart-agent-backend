@@ -253,6 +253,14 @@ app.post("/trade-plan", async (req, res) => {
         const sigma = Math.max(s.ivPct ?? 20, 0.01) / 100;
         const entryCalc = blackScholes(spot, s.strike, Tentry, r, sigma, direction);
         const entryPremium = s.bid ?? entryCalc.price;
+
+        // Sanity check: a real premium can never be below its own intrinsic
+        // value. If the quoted bid violates this, the vision extraction
+        // almost certainly misread/misaligned this row — drop it rather
+        // than let bad data produce a fake, huge "return %".
+        const intrinsic = direction === "call" ? Math.max(spot - s.strike, 0) : Math.max(s.strike - spot, 0);
+        if (entryPremium < intrinsic - 0.01) return null;
+
         let ret = null;
         if (target) {
           const atTarget = blackScholes(target, s.strike, Tremain, r, sigma, direction);
@@ -265,7 +273,8 @@ app.post("/trade-plan", async (req, res) => {
           delta: +entryCalc.delta.toFixed(2),
           estimatedReturnPct: ret !== null ? +ret.toFixed(0) : null,
         };
-      });
+      })
+      .filter(Boolean);
 
     // Rank: prefer real target-based return if we have a target; otherwise
     // prefer strikes closest to at-the-money (delta closest to 0.5 magnitude)
@@ -279,6 +288,29 @@ app.post("/trade-plan", async (req, res) => {
       best = ranked.reduce((a, b) => (Math.abs(Math.abs(b.delta) - 0.5) < Math.abs(Math.abs(a.delta) - 0.5) ? b : a));
     }
 
+    const totalStrikesRead = (chain.strikes || []).filter((s) => s.strike > 0).length;
+    const droppedCount = totalStrikesRead - ranked.length;
+
+    // No chart target? Fall back to the market's OWN implied expected move
+    // (from the recommended strike's IV) rather than showing no exit
+    // scenario at all. This is derived from real market data (IV), not a
+    // guessed price — but it's a range, not a prediction of direction.
+    let impliedRange = null;
+    if (!target && best) {
+      const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
+      const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
+      const expectedMove = spot * sigma * Math.sqrt(Tentry);
+      const upSpot = spot + expectedMove;
+      const downSpot = spot - expectedMove;
+      const upVal = blackScholes(upSpot, best.strike, Tremain, r, sigma, direction).price;
+      const downVal = blackScholes(downSpot, best.strike, Tremain, r, sigma, direction).price;
+      impliedRange = {
+        expectedMovePoints: +expectedMove.toFixed(2),
+        ifUp: { spot: +upSpot.toFixed(2), premium: +upVal.toFixed(2) },
+        ifDown: { spot: +downSpot.toFixed(2), premium: +downVal.toFixed(2) },
+      };
+    }
+
     const ladder = best ? initialLadder(best.entryPremium) : null;
 
     res.json({
@@ -290,10 +322,14 @@ app.post("/trade-plan", async (req, res) => {
       entryZone: chart && chart.entryZoneLower ? { lower: chart.entryZoneLower, upper: chart.entryZoneUpper } : null,
       recommendedStrike: best,
       allStrikesRanked: ranked.sort((a, b) => a.strike - b.strike),
+      impliedRange,
       ladder,
       chartConfidence: chart ? chart.confidence : "no chart provided",
-      notes: [chart && chart.notes, !target ? "No target level was read from the chart — ranking by near-the-money delta instead of estimated return." : null]
-        .filter(Boolean),
+      notes: [
+        chart && chart.notes,
+        !target ? "No target level was read from the chart — ranking by near-the-money delta instead of estimated return." : null,
+        droppedCount > 0 ? `Discarded ${droppedCount} strike(s) with a quoted premium below their own intrinsic value — likely a misread from the screenshot, not a real quote.` : null,
+      ].filter(Boolean),
     });
   } catch (err) {
     console.error(err);
