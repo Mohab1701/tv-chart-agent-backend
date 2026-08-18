@@ -172,7 +172,7 @@ app.post("/trade-plan", async (req, res) => {
     const { chartImage, chainImage } = req.body;
     if (!chainImage) return res.status(400).json({ error: "Options chain screenshot is required." });
 
-    async function extractJSONOnce(image, prompt) {
+    async function extractJSON(image, prompt) {
       const match = image.match(/^data:(image\/\w+);base64,(.+)$/);
       if (!match) throw new Error("Bad image format");
       const [, mediaType, base64Data] = match;
@@ -195,35 +195,15 @@ app.post("/trade-plan", async (req, res) => {
         .join("")
         .trim()
         .replace(/^```json\s*|\s*```$/g, "");
-
       if (!raw) {
-        const diag = `Claude returned no text (stop_reason: ${message.stop_reason}, content blocks: ${message.content.map((b) => b.type).join(",") || "none"}).`;
-        console.error("Empty response.", diag);
-        throw new Error(diag);
+        console.error("Empty response from Claude for prompt starting:", prompt.slice(0, 50));
+        throw new Error("Claude returned an empty response for this image.");
       }
       try {
         return JSON.parse(raw);
       } catch (e) {
-        const preview = raw.slice(0, 150);
         console.error("Failed to parse JSON. Raw text was:", raw);
-        throw new Error(`Response wasn't valid JSON. Claude said: "${preview}${raw.length > 150 ? "..." : ""}"`);
-      }
-    }
-
-    // Retry once on failure — LLM APIs occasionally produce a genuinely
-    // empty or malformed response as a one-off glitch, not a real problem
-    // with the image or prompt. Only surface an error to the user if BOTH
-    // attempts fail, and include the real reason from the second attempt.
-    async function extractJSON(image, prompt) {
-      try {
-        return await extractJSONOnce(image, prompt);
-      } catch (firstErr) {
-        console.error("First attempt failed, retrying once:", firstErr.message);
-        try {
-          return await extractJSONOnce(image, prompt);
-        } catch (secondErr) {
-          throw new Error(`Failed twice. Last error: ${secondErr.message}`);
-        }
+        throw new Error("Could not parse a readable chain from that screenshot — it may not have shown a visible options table.");
       }
     }
 
@@ -232,7 +212,8 @@ app.post("/trade-plan", async (req, res) => {
       chain = await extractJSON(chainImage, CHAIN_EXTRACT_PROMPT);
     } catch (e) {
       return res.status(200).json({
-        error: "Could not read the options chain, even after retrying once. Real reason: " + e.message,
+        error: "Could not read the options chain from that screenshot: " + e.message +
+               " Make sure the Sahm tab is showing the full options chain table (not just a summary page) before analyzing.",
       });
     }
 
