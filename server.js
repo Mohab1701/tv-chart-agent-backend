@@ -99,7 +99,7 @@ app.post("/analyze", async (req, res) => {
 
     const message = await anthropic.messages.create({
       model: "claude-sonnet-5",
-      max_tokens: 500,
+      max_tokens: 1000,
       system: SYSTEM_PROMPT,
       messages: [
         {
@@ -178,7 +178,7 @@ app.post("/trade-plan", async (req, res) => {
       const [, mediaType, base64Data] = match;
       const message = await anthropic.messages.create({
         model: "claude-sonnet-5",
-        max_tokens: 1200,
+        max_tokens: 8192,
         messages: [
           {
             role: "user",
@@ -387,7 +387,7 @@ app.post("/watch", async (req, res) => {
 
     const message = await anthropic.messages.create({
       model: "claude-sonnet-5",
-      max_tokens: 300,
+      max_tokens: 500,
       system: WATCH_SYSTEM_PROMPT,
       messages: [
         {
