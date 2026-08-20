@@ -178,7 +178,7 @@ app.post("/trade-plan", async (req, res) => {
       const [, mediaType, base64Data] = match;
       const message = await anthropic.messages.create({
         model: "claude-sonnet-5",
-        max_tokens: 1200,
+        max_tokens: 4096,
         messages: [
           {
             role: "user",
