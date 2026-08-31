@@ -180,7 +180,7 @@ const CHAIN_EXTRACT_PROMPT = `You are reading a screenshot of an options chain
 ${new Date().toISOString().slice(0, 10)}. Extract what you can see and
 respond with ONLY a JSON object, no other text, no markdown fences:
 {
-  "optionType": "call" or "put" (خيار الشراء = call, خيار البيع = put — check which tab is selected),
+  "optionType": "call" or "put" or "unclear" (خيار الشراء = call, خيار البيع = put — check which SPECIFIC tab is selected. The Sahm chain view also has a third tab, الكل = "All", which shows both calls and puts together — if الكل is the one selected/highlighted, or you otherwise can't tell one specific side is chosen, use "unclear" rather than guessing call or put),
   "expirationDateText": "the expiration date shown, in whatever form you see it",
   "daysToExpiration": number (compute from today's date to the expiration shown; use 0 if it expires today),
   "underlyingSpot": number or null (if shown near the top of the screen),
@@ -267,11 +267,16 @@ app.post("/trade-plan", async (req, res) => {
     }
  
     // Direction priority fix: the chain's own optionType is a direct fact
-    // (which tab — calls or puts — is actually selected in the Sahm chain
-    // screenshot). The chart's "direction" is a soft, inferred judgment.
-    // Trust the direct fact first; only fall back to the chart's inferred
-    // read if the chain screenshot didn't show a usable optionType.
-    const direction = chain.optionType || (chart && chart.direction !== "unclear" && chart.direction) || "call";
+    // ONLY when a specific calls/puts tab is actually selected in the Sahm
+    // screenshot — not when the "الكل" (All) tab is showing both sides, in
+    // which case optionType comes back "unclear" and is worth no more trust
+    // than the chart's own inferred read. Trust the chain's direct fact
+    // first, but only when it's actually unambiguous; otherwise fall back
+    // to the chart's inferred read, same as before.
+    const direction =
+      (chain.optionType && chain.optionType !== "unclear" && chain.optionType) ||
+      (chart && chart.direction !== "unclear" && chart.direction) ||
+      "call";
     const spot = (chart && chart.spot) || chain.underlyingSpot;
     const target = chart && chart.targetLevel;
     const dte = Math.max(chain.daysToExpiration ?? 0, 0);
