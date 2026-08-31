@@ -1,329 +1,525 @@
-const log = document.getElementById("log");
-const statusEl = document.getElementById("status");
-const textInput = document.getElementById("textInput");
-const sendBtn = document.getElementById("sendBtn");
-const talkBtn = document.getElementById("talkBtn");
-
-function addMsg(text, cls) {
-  const div = document.createElement("div");
-  div.className = "msg " + cls;
-  div.textContent = text;
-  log.appendChild(div);
-  log.scrollTop = log.scrollHeight;
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const Anthropic = require("@anthropic-ai/sdk");
+ 
+const app = express();
+app.use(express.json({ limit: "15mb" }));
+ 
+// Locks down which origins may call this backend. Chrome extensions call
+// from an origin like chrome-extension://<your-extension-id> — fill that
+// in once you've loaded the extension and know its ID (see README).
+const ALLOWED_ORIGIN = process.env.ALLOWED_EXTENSION_ORIGIN || "*";
+app.use(cors({ origin: ALLOWED_ORIGIN }));
+ 
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+ 
+// Logs every incoming request so Render's log view shows exactly what's
+// arriving, for debugging.
+app.use((req, res, next) => {
+  console.log("Incoming:", req.method, req.path);
+  next();
+});
+ 
+// ---- Black-Scholes engine (same math as the Options Strike & Expiry
+// Reader tool, ported so the server can rank strikes with real arithmetic
+// instead of asking the model to eyeball it) --------------------------------
+function erf(x) {
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x);
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741,
+        a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  return sign * y;
 }
-
-function speak(text) {
-  window.speechSynthesis.cancel();
-  const utter = new SpeechSynthesisUtterance(text);
-  utter.rate = 1.02;
-  window.speechSynthesis.speak(utter);
-}
-
-// Finds the TradingView tab (this window is a separate popup window now,
-// not the tab itself) and screenshots THAT tab's window. If no TradingView
-// tab is open anywhere, this fails clearly rather than capturing the wrong
-// thing.
-function findTradingViewTab() {
-  return new Promise((resolve, reject) => {
-    chrome.tabs.query({ url: ["*://*.tradingview.com/*"] }, (tabs) => {
-      if (chrome.runtime.lastError) return reject(chrome.runtime.lastError);
-      if (!tabs || tabs.length === 0) {
-        return reject(new Error("No TradingView tab is open. Open tradingview.com first."));
-      }
-      // Prefer the currently active one if multiple are open.
-      const active = tabs.find((t) => t.active) || tabs[0];
-      resolve(active);
-    });
-  });
-}
-
-function captureActiveTab() {
-  return new Promise((resolve, reject) => {
-    findTradingViewTab()
-      .then((tab) => {
-        chrome.windows.update(tab.windowId, { focused: true }, () => {
-          chrome.tabs.update(tab.id, { active: true }, () => {
-            setTimeout(() => {
-              chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" }, (dataUrl) => {
-                if (chrome.runtime.lastError || !dataUrl) {
-                  reject(chrome.runtime.lastError || new Error("Capture failed"));
-                } else {
-                  resolve(dataUrl);
-                }
-              });
-            }, 1200);
-          });
-        });
-      })
-      .catch(reject);
-  });
-}
-
-async function askAgent(userText) {
-  addMsg(userText || "(chart check)", "user");
-  statusEl.textContent = "capturing chart...";
-  try {
-    const image = await captureActiveTab();
-    statusEl.textContent = "thinking...";
-    const res = await fetch(BACKEND_URL + "/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image, text: userText }),
-    });
-    if (!res.ok) throw new Error("Backend error " + res.status);
-    const data = await res.json();
-    addMsg(data.reply, "agent");
-    speak(data.reply);
-  } catch (err) {
-    addMsg("Error: " + err.message, "err");
-  } finally {
-    statusEl.textContent = "scoped to TradingView tabs only";
+const normCDF = (x) => 0.5 * (1 + erf(x / Math.sqrt(2)));
+const normPDF = (x) => Math.exp((-x * x) / 2) / Math.sqrt(2 * Math.PI);
+ 
+function blackScholes(S, K, T, r, sigma, type) {
+  if (T <= 0) {
+    const intrinsic = type === "call" ? Math.max(S - K, 0) : Math.max(K - S, 0);
+    return { price: intrinsic, delta: type === "call" ? (S > K ? 1 : 0) : (S < K ? -1 : 0), theta: 0 };
   }
-}
-
-sendBtn.addEventListener("click", () => {
-  const val = textInput.value.trim();
-  if (!val) return;
-  textInput.value = "";
-  askAgent(val);
-});
-textInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") sendBtn.click();
-});
-
-// ---- Push to talk ----------------------------------------------------
-let recognition = null;
-let recognizing = false;
-
-function setupRecognition() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) {
-    talkBtn.textContent = "Voice input not supported in this browser";
-    talkBtn.disabled = true;
-    return;
-  }
-  recognition = new SpeechRecognition();
-  recognition.continuous = false;
-  recognition.interimResults = false;
-  recognition.lang = "en-US";
-
-  recognition.onresult = (e) => {
-    const transcript = e.results[0][0].transcript;
-    askAgent(transcript);
-  };
-  recognition.onerror = (e) => {
-    addMsg("Mic error: " + e.error, "err");
-  };
-  recognition.onend = () => {
-    recognizing = false;
-    talkBtn.classList.remove("recording");
-    talkBtn.textContent = "🎤 Hold to talk";
-  };
-}
-setupRecognition();
-
-talkBtn.addEventListener("mousedown", () => {
-  if (!recognition || recognizing) return;
-  recognizing = true;
-  talkBtn.classList.add("recording");
-  talkBtn.textContent = "🔴 Listening... release when done";
-  recognition.start();
-});
-talkBtn.addEventListener("mouseup", () => {
-  if (recognition && recognizing) recognition.stop();
-});
-talkBtn.addEventListener("mouseleave", () => {
-  if (recognition && recognizing) recognition.stop();
-});
-
-// ---- Continuous watch --------------------------------------------------
-// Runs only while this panel is open. Checks the chart on an interval,
-// but only speaks up when the backend says something actually changed —
-// every check still costs one API call, so keep the interval sane.
-const watchToggle = document.getElementById("watchToggle");
-const intervalSelect = document.getElementById("intervalSelect");
-const watchStatus = document.getElementById("watchStatus");
-
-let watchTimer = null;
-let lastState = ""; // short text summary the backend hands back each check, fed into the next one
-
-async function watchTick() {
-  try {
-    const image = await captureActiveTab();
-    const res = await fetch(BACKEND_URL + "/watch", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image, lastState }),
-    });
-    if (!res.ok) throw new Error("Backend error " + res.status);
-    const data = await res.json();
-    lastState = data.summary || lastState;
-
-    const stamp = new Date().toLocaleTimeString();
-    if (data.alert) {
-      addMsg(data.message, "agent");
-      speak(data.message);
-    } else {
-      addMsg(stamp + " — no change", "quiet");
-    }
-    watchStatus.textContent = "last check: " + stamp;
-  } catch (err) {
-    watchStatus.textContent = "watch error: " + err.message;
-  }
-}
-
-watchToggle.addEventListener("change", () => {
-  if (watchToggle.checked) {
-    const seconds = parseInt(intervalSelect.value, 10);
-    watchStatus.textContent = "watching every " + seconds + "s...";
-    watchTick(); // check immediately, then on interval
-    watchTimer = setInterval(watchTick, seconds * 1000);
+  if (sigma <= 0) sigma = 0.0001;
+  const d1 = (Math.log(S / K) + (r + (sigma * sigma) / 2) * T) / (sigma * Math.sqrt(T));
+  const d2 = d1 - sigma * Math.sqrt(T);
+  if (type === "call") {
+    const price = S * normCDF(d1) - K * Math.exp(-r * T) * normCDF(d2);
+    const delta = normCDF(d1);
+    const theta = (-(S * normPDF(d1) * sigma) / (2 * Math.sqrt(T)) - r * K * Math.exp(-r * T) * normCDF(d2)) / 365;
+    return { price: Math.max(price, 0), delta, theta };
   } else {
-    clearInterval(watchTimer);
-    watchTimer = null;
-    watchStatus.textContent = "watch stopped";
+    const price = K * Math.exp(-r * T) * normCDF(-d2) - S * normCDF(-d1);
+    const delta = normCDF(d1) - 1;
+    const theta = (-(S * normPDF(d1) * sigma) / (2 * Math.sqrt(T)) + r * K * Math.exp(-r * T) * normCDF(-d2)) / 365;
+    return { price: Math.max(price, 0), delta, theta };
   }
-});
-
-intervalSelect.addEventListener("change", () => {
-  if (watchTimer) {
-    clearInterval(watchTimer);
-    const seconds = parseInt(intervalSelect.value, 10);
-    watchTimer = setInterval(watchTick, seconds * 1000);
-    watchStatus.textContent = "watching every " + seconds + "s...";
-  }
-});
-
-// ---- Combined Trade Setup Analysis (TradingView + Sahm) -------------------
-function findTabByUrlPattern(pattern) {
-  return new Promise((resolve, reject) => {
-    chrome.tabs.query({ url: [pattern] }, (tabs) => {
-      if (chrome.runtime.lastError) return reject(chrome.runtime.lastError);
-      if (!tabs || tabs.length === 0) return resolve(null);
-      resolve(tabs.find((t) => t.active) || tabs[0]);
-    });
-  });
 }
-
-// captureVisibleTab can only capture whichever tab is CURRENTLY on-screen
-// in its window — it cannot reach a background tab just because we found
-// it by URL. So before capturing, we explicitly switch to that tab and
-// its window, wait briefly for it to render, then capture. This means the
-// browser will visibly flip to that tab for a moment — unavoidable given
-// how Chrome's capture API works.
-function captureTab(tab) {
-  return new Promise((resolve, reject) => {
-    chrome.windows.update(tab.windowId, { focused: true }, () => {
-      chrome.tabs.update(tab.id, { active: true }, () => {
-        setTimeout(() => {
-          chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" }, (dataUrl) => {
-            if (chrome.runtime.lastError || !dataUrl) {
-              reject(chrome.runtime.lastError || new Error("Capture failed"));
-            } else {
-              resolve(dataUrl);
-            }
-          });
-        }, 1200); // give the tab a moment to actually render before capturing
-      });
-    });
-  });
+ 
+// Position & Risk ladder: 45% initial SL, breakeven at +40% profit, then
+// trail 20% closer per further +20% profit — same rules as the Options tool.
+function initialLadder(entryPremium) {
+  return {
+    initialSLPremium: +(entryPremium * 0.55).toFixed(2),
+    breakevenTriggerPct: 40,
+    trailStepPct: 20,
+  };
 }
-
-function renderPlan(plan) {
-  const div = document.createElement("div");
-  div.className = "plan";
-  if (plan.error) {
-    div.innerHTML = `<div style="color:#FB7185">${plan.error}</div>`;
-    log.appendChild(div);
-    log.scrollTop = log.scrollHeight;
-    return;
-  }
-  const rec = plan.recommendedStrike;
-  const entry = plan.recommendedEntry;
-  div.innerHTML = `
-    <div class="row"><span class="label">Direction</span><span>${plan.direction.toUpperCase()}</span></div>
-    <div class="row"><span class="label">Spot</span><span>${plan.spot}</span></div>
-    <div class="row"><span class="label">Target</span><span>${plan.target ?? "not read from chart"}</span></div>
-    <div class="row"><span class="label">Days to expiration</span><span>${plan.daysToExpiration}</span></div>
-    ${plan.entryZone ? `<div class="row"><span class="label">Entry zone</span><span>${plan.entryZone.lower} - ${plan.entryZone.upper}</span></div>` : ""}
-    ${rec ? `
-    <div class="best">
-      <div class="row"><span class="label">Recommended strike</span><span>${rec.strike}</span></div>
-      <div class="row"><span class="label">Entry premium</span><span>$${rec.entryPremium}</span></div>
-      <div class="row"><span class="label">Delta</span><span>${rec.delta}</span></div>
-      ${rec.estimatedReturnPct !== null ? `<div class="row"><span class="label">Est. return @ target</span><span>${rec.estimatedReturnPct}%</span></div>` : ""}
-      ${plan.ladder ? `<div class="row"><span class="label">Initial SL (45%)</span><span>$${plan.ladder.initialSLPremium}</span></div>` : ""}
-    </div>` : `<div style="color:#FB7185; margin-top:6px;">No strike could be ranked from the chain data.</div>`}
-    ${entry ? `
-    <div class="best" style="border-top-color:#F5B94255;">
-      <div style="color:#F5B942; font-size:11px; margin-bottom:4px;">${entry.waitRequired ? "Wait-for-pullback price (estimate)" : "Pullback zone already reached"}</div>
-      <div class="row"><span class="label">Marked zone</span><span>${entry.zoneLower} - ${entry.zoneUpper}</span></div>
-      ${entry.waitRequired ? `<div class="row"><span class="label">Est. premium in zone</span><span>$${entry.estimatedPremium}</span></div>` : ""}
-      <div style="color:#6B7785; margin-top:4px; font-size:10px;">${entry.note}</div>
-    </div>` : ""}
-    ${plan.impliedRange ? `
-    <div class="best" style="border-top-color:#2A3D4A;">
-      <div style="color:#5EC8E8; font-size:11px; margin-bottom:4px;">Market-implied expected range (from IV, not a target)</div>
-      <div class="row"><span class="label">If it moves up ~${plan.impliedRange.expectedMovePoints} to ${plan.impliedRange.ifUp.spot}</span><span>$${plan.impliedRange.ifUp.premium}</span></div>
-      <div class="row"><span class="label">If it moves down ~${plan.impliedRange.expectedMovePoints} to ${plan.impliedRange.ifDown.spot}</span><span>$${plan.impliedRange.ifDown.premium}</span></div>
-    </div>` : ""}
-    ${plan.notes && plan.notes.length ? `<div style="color:#6B7785; margin-top:6px; font-size:11px;">${plan.notes.join(" ")}</div>` : ""}
-  `;
-  log.appendChild(div);
-  log.scrollTop = log.scrollHeight;
-}
-
-const tradePlanBtn = document.getElementById("tradePlanBtn");
-tradePlanBtn.addEventListener("click", async () => {
-  addMsg("Analyze trade setup", "user");
-  statusEl.textContent = "finding tabs...";
+ 
+const SYSTEM_PROMPT = `You are a trading chart analyst assistant. You are shown a
+screenshot of the user's live TradingView chart and, optionally, a question
+they asked (by voice or text). The user trades using Smart Money Concepts:
+Change of Character (CHoCH), Break of Structure (BOS), Fair Value Gaps (FVG),
+Order Blocks (OB), and liquidity sweeps.
+ 
+When you look at the chart:
+- State the current trend/bias plainly.
+- Note any CHoCH/BOS visible on the chart.
+- Point out any FVG or Order Block zones you can see, and any nearby
+  liquidity (recent swing highs/lows) that could get swept.
+- If the user asked a specific question, answer it directly first.
+- Be honest about uncertainty — if the screenshot doesn't show enough to
+  call something confidently (e.g. no clear FVG visible), say so rather
+  than guessing.
+ 
+Your reply will be read aloud by text-to-speech, so: keep it conversational
+and concise (2-5 sentences for a quick check, more only if genuinely
+warranted), avoid markdown formatting, tables, or bullet lists, and don't
+use symbols that sound awkward spoken aloud.`;
+ 
+app.post("/analyze", async (req, res) => {
   try {
-    const [tvTab, sahmTab] = await Promise.all([
-      findTabByUrlPattern("*://*.tradingview.com/*"),
-      findTabByUrlPattern("*://app.sahmcapital.com/*"),
-    ]);
-    if (!sahmTab) {
-      addMsg("Error: No Sahm options chain tab is open. Open app.sahmcapital.com to an options chain page first.", "err");
-      statusEl.textContent = "opens as a window · captures whichever tab has TradingView open";
-      return;
+    const { image, text } = req.body;
+    if (!image) return res.status(400).json({ error: "No image provided" });
+ 
+    const match = image.match(/^data:(image\/\w+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: "Bad image format" });
+    const [, mediaType, base64Data] = match;
+ 
+    async function analyzeOnce() {
+      const message = await anthropic.messages.create({
+        model: "claude-sonnet-5",
+        max_tokens: 1500,
+        system: SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } },
+              { type: "text", text: text && text.trim() ? text : "What do you see on this chart right now?" },
+            ],
+          },
+        ],
+      });
+ 
+      const reply = message.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+ 
+      if (!reply) {
+        const diag = `Claude returned no text (stop_reason: ${message.stop_reason}, content blocks: ${message.content.map((b) => b.type).join(",") || "none"}).`;
+        console.error("Empty response from /analyze.", diag);
+        throw new Error(diag);
+      }
+      return reply;
     }
-
-    statusEl.textContent = "capturing tabs...";
-    const chainImage = await captureTab(sahmTab);
-    const chartImage = tvTab ? await captureTab(tvTab) : null;
-
-    // Show thumbnails of exactly what got captured, so a bad capture is
-    // immediately visible instead of hiding inside an opaque JSON result.
-    const preview = document.createElement("div");
-    preview.style.cssText = "display:flex; gap:6px; margin-bottom:8px;";
-    preview.innerHTML = `
-      <div style="flex:1;">
-        <div style="font-size:10px; color:#6B7785; margin-bottom:2px;">Sahm capture</div>
-        <img src="${chainImage}" style="width:100%; border:1px solid #1E252D; border-radius:4px;" />
-      </div>
-      ${chartImage ? `<div style="flex:1;">
-        <div style="font-size:10px; color:#6B7785; margin-bottom:2px;">TradingView capture</div>
-        <img src="${chartImage}" style="width:100%; border:1px solid #1E252D; border-radius:4px;" />
-      </div>` : ""}
-    `;
-    log.appendChild(preview);
-    log.scrollTop = log.scrollHeight;
-
-    statusEl.textContent = "analyzing...";
-    const res = await fetch(BACKEND_URL + "/trade-plan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chainImage, chartImage }),
-    });
-    if (!res.ok) throw new Error("Backend error " + res.status);
-    const plan = await res.json();
-    renderPlan(plan);
-    if (plan.recommendedStrike) {
-      speak(`Recommended ${plan.direction} strike ${plan.recommendedStrike.strike}, entry premium ${plan.recommendedStrike.entryPremium} dollars.`);
+ 
+    // Retry once on a genuinely empty response — LLM APIs occasionally
+    // produce a one-off empty response as a transient glitch, same handling
+    // as /trade-plan's extraction calls.
+    let reply;
+    try {
+      reply = await analyzeOnce();
+    } catch (firstErr) {
+      console.error("First /analyze attempt failed, retrying once:", firstErr.message);
+      reply = await analyzeOnce();
     }
+ 
+    res.json({ reply });
   } catch (err) {
-    addMsg("Error: " + err.message, "err");
-  } finally {
-    statusEl.textContent = "opens as a window · captures whichever tab has TradingView open";
+    console.error(err);
+    res.status(500).json({ error: err.message || "Server error" });
   }
 });
+ 
+app.get("/", (req, res) => res.send("TradingView chart agent backend is running."));
+ 
+app.get("/debug/routes", (req, res) => {
+  const routes = [];
+  app._router.stack.forEach((layer) => {
+    if (layer.route) {
+      const methods = Object.keys(layer.route.methods).join(",").toUpperCase();
+      routes.push(methods + " " + layer.route.path);
+    }
+  });
+  res.json({ routes });
+});
+ 
+const CHART_EXTRACT_PROMPT = `You are reading a TradingView chart screenshot for a
+trader using Smart Money Concepts (CHoCH, BOS, Fair Value Gaps, Order Blocks,
+liquidity sweeps). Extract what you can see and respond with ONLY a JSON
+object, no other text, no markdown fences:
+{
+  "direction": "call" or "put" or "unclear",
+  "spot": number (current price shown on the chart) or null if not visible,
+  "entryZoneLower": number or null (lower edge of a marked FVG/OB zone, if any),
+  "entryZoneUpper": number or null (upper edge of that zone, if any),
+  "targetLevel": number or null (a marked liquidity/target level, if any),
+  "confidence": "high", "medium", or "low",
+  "notes": "one short sentence on what you saw, or what's missing/unclear"
+}
+If no zone or target is marked on the chart, use null for those fields rather
+than guessing a number.`;
+ 
+const CHAIN_EXTRACT_PROMPT = `You are reading a screenshot of an options chain
+(from the Sahm trading app, UI is in Arabic — سعر التنفيذ = strike price,
+التقلب الضمني = implied volatility, سعر العرض = bid price). Today's date is
+${new Date().toISOString().slice(0, 10)}. Extract what you can see and
+respond with ONLY a JSON object, no other text, no markdown fences:
+{
+  "optionType": "call" or "put" (خيار الشراء = call, خيار البيع = put — check which tab is selected),
+  "expirationDateText": "the expiration date shown, in whatever form you see it",
+  "daysToExpiration": number (compute from today's date to the expiration shown; use 0 if it expires today),
+  "underlyingSpot": number or null (if shown near the top of the screen),
+  "strikes": [ { "strike": number, "ivPct": number or null, "bid": number or null } ]
+}
+List every strike row visible in the screenshot. If IV shows "--", use null for ivPct.`;
+ 
+app.post("/trade-plan", async (req, res) => {
+  try {
+    const { chartImage, chainImage } = req.body;
+    if (!chainImage) return res.status(400).json({ error: "Options chain screenshot is required." });
+ 
+    async function extractJSONOnce(image, prompt) {
+      const match = image.match(/^data:(image\/\w+);base64,(.+)$/);
+      if (!match) throw new Error("Bad image format");
+      const [, mediaType, base64Data] = match;
+      const message = await anthropic.messages.create({
+        model: "claude-sonnet-5",
+        max_tokens: 8192,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } },
+              { type: "text", text: prompt },
+            ],
+          },
+        ],
+      });
+      const raw = message.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("")
+        .trim()
+        .replace(/^```json\s*|\s*```$/g, "");
+ 
+      if (!raw) {
+        const diag = `Claude returned no text (stop_reason: ${message.stop_reason}, content blocks: ${message.content.map((b) => b.type).join(",") || "none"}).`;
+        console.error("Empty response.", diag);
+        throw new Error(diag);
+      }
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        const preview = raw.slice(0, 150);
+        console.error("Failed to parse JSON. Raw text was:", raw);
+        throw new Error(`Response wasn't valid JSON. Claude said: "${preview}${raw.length > 150 ? "..." : ""}"`);
+      }
+    }
+ 
+    // Retry once on failure — LLM APIs occasionally produce a genuinely
+    // empty or malformed response as a one-off glitch, not a real problem
+    // with the image or prompt. Only surface an error to the user if BOTH
+    // attempts fail, and include the real reason from the second attempt.
+    async function extractJSON(image, prompt) {
+      try {
+        return await extractJSONOnce(image, prompt);
+      } catch (firstErr) {
+        console.error("First attempt failed, retrying once:", firstErr.message);
+        try {
+          return await extractJSONOnce(image, prompt);
+        } catch (secondErr) {
+          throw new Error(`Failed twice. Last error: ${secondErr.message}`);
+        }
+      }
+    }
+ 
+    let chain;
+    try {
+      chain = await extractJSON(chainImage, CHAIN_EXTRACT_PROMPT);
+    } catch (e) {
+      return res.status(200).json({
+        error: "Could not read the options chain, even after retrying once. Real reason: " + e.message,
+      });
+    }
+ 
+    let chart = null;
+    if (chartImage) {
+      try {
+        chart = await extractJSON(chartImage, CHART_EXTRACT_PROMPT);
+      } catch (e) {
+        chart = null; // chart read is best-effort; chain data is the essential part
+      }
+    }
+ 
+    // Direction priority fix: the chain's own optionType is a direct fact
+    // (which tab — calls or puts — is actually selected in the Sahm chain
+    // screenshot). The chart's "direction" is a soft, inferred judgment.
+    // Trust the direct fact first; only fall back to the chart's inferred
+    // read if the chain screenshot didn't show a usable optionType.
+    const direction = chain.optionType || (chart && chart.direction !== "unclear" && chart.direction) || "call";
+    const spot = (chart && chart.spot) || chain.underlyingSpot;
+    const target = chart && chart.targetLevel;
+    const dte = Math.max(chain.daysToExpiration ?? 0, 0);
+ 
+    if (!spot) {
+      return res.json({
+        error: "Could not determine the underlying spot price from either screenshot — include a chart or a chain screenshot that shows it.",
+        chain, chart,
+      });
+    }
+ 
+    // Assume, absent other info, that the target (if any) is reached halfway
+    // through the remaining time — a neutral placeholder, not a prediction.
+    // If no target was read from the chart, fall back to ranking strikes by
+    // near-the-money preference only (no target-based return calc).
+    const Tentry = dte / 365;
+    const elapsedAssumed = dte / 2;
+    const Tremain = Math.max(dte - elapsedAssumed, 0) / 365;
+    const r = 0.043;
+ 
+    const ranked = (chain.strikes || [])
+      .filter((s) => s.strike > 0)
+      .map((s) => {
+        const sigma = Math.max(s.ivPct ?? 20, 0.01) / 100;
+        const entryCalc = blackScholes(spot, s.strike, Tentry, r, sigma, direction);
+        const entryPremium = s.bid ?? entryCalc.price;
+ 
+        // Sanity check: a real premium can never be below its own intrinsic
+        // value. If the quoted bid violates this, the vision extraction
+        // almost certainly misread/misaligned this row — drop it rather
+        // than let bad data produce a fake, huge "return %".
+        const intrinsic = direction === "call" ? Math.max(spot - s.strike, 0) : Math.max(s.strike - spot, 0);
+        if (entryPremium < intrinsic - 0.01) return null;
+ 
+        let ret = null;
+        if (target) {
+          const atTarget = blackScholes(target, s.strike, Tremain, r, sigma, direction);
+          ret = entryPremium > 0.01 ? ((atTarget.price - entryPremium) / entryPremium) * 100 : null;
+        }
+        return {
+          strike: s.strike,
+          ivPct: s.ivPct,
+          entryPremium: +entryPremium.toFixed(2),
+          delta: +entryCalc.delta.toFixed(2),
+          estimatedReturnPct: ret !== null ? +ret.toFixed(0) : null,
+        };
+      })
+      .filter(Boolean);
+ 
+    // Rank: prefer real target-based return if we have a target; otherwise
+    // prefer strikes closest to at-the-money (delta closest to 0.5 magnitude)
+    // since that's the safer default for 0-3 DTE per our earlier discussion.
+    let best = null;
+    if (target) {
+      const withReturn = ranked.filter((s) => s.estimatedReturnPct !== null);
+      if (withReturn.length) best = withReturn.reduce((a, b) => (b.estimatedReturnPct > a.estimatedReturnPct ? b : a));
+    }
+    if (!best && ranked.length) {
+      best = ranked.reduce((a, b) => (Math.abs(Math.abs(b.delta) - 0.5) < Math.abs(Math.abs(a.delta) - 0.5) ? b : a));
+    }
+ 
+    const totalStrikesRead = (chain.strikes || []).filter((s) => s.strike > 0).length;
+    const droppedCount = totalStrikesRead - ranked.length;
+ 
+    // No chart target? Fall back to the market's OWN implied expected move
+    // (from the recommended strike's IV) rather than showing no exit
+    // scenario at all. This is derived from real market data (IV), not a
+    // guessed price — but it's a range, not a prediction of direction.
+    let impliedRange = null;
+    if (!target && best) {
+      const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
+      const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
+      // On a same-day (0 DTE) expiry, Tentry is exactly 0, which would
+      // collapse this to a $0 expected move regardless of IV — technically
+      // "correct" (0 days left = 0 variance under this model) but useless,
+      // since a 0 DTE index option still has real intraday movement left
+      // before the close. Same neutral-placeholder philosophy as the
+      // halfway-elapsed assumption above: assume half a trading day of
+      // time remains for this specific calculation, rather than none.
+      const TentryForMove = dte > 0 ? Tentry : 0.5 / 365;
+      const expectedMove = spot * sigma * Math.sqrt(TentryForMove);
+      const upSpot = spot + expectedMove;
+      const downSpot = spot - expectedMove;
+      const upVal = blackScholes(upSpot, best.strike, Tremain, r, sigma, direction).price;
+      const downVal = blackScholes(downSpot, best.strike, Tremain, r, sigma, direction).price;
+      impliedRange = {
+        expectedMovePoints: +expectedMove.toFixed(2),
+        ifUp: { spot: +upSpot.toFixed(2), premium: +upVal.toFixed(2) },
+        ifDown: { spot: +downSpot.toFixed(2), premium: +downVal.toFixed(2) },
+      };
+    }
+ 
+    const ladder = best ? initialLadder(best.entryPremium) : null;
+
+    // Optional "wait for a pullback" reference price: only computed when the
+    // chart actually has a marked FVG/Order Block entry zone. This is a
+    // Black-Scholes ESTIMATE of what the recommended strike would be worth
+    // if price pulls back into that zone — using today's IV at a
+    // hypothetical spot, not a live quote from the chain and not a
+    // guarantee the option trades there if/when price arrives. The current
+    // premium (recommendedStrike.entryPremium) is always the real, live
+    // price right now; this is only a "here's roughly what it'd cost if
+    // your marked zone gets hit" reference, not a replacement for it.
+    let recommendedEntry = null;
+    if (best && chart && chart.entryZoneLower != null && chart.entryZoneUpper != null) {
+      const zoneLower = chart.entryZoneLower;
+      const zoneUpper = chart.entryZoneUpper;
+      const zoneMid = (zoneLower + zoneUpper) / 2;
+      const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
+      const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
+      const atZone = blackScholes(zoneMid, best.strike, Tentry, r, sigma, direction);
+      // A call's demand zone normally sits below spot (price dips in before
+      // continuing up); a put's supply zone normally sits above spot. Only
+      // call this an actual "wait" if price hasn't reached the zone yet —
+      // if it's already there or through it, the current premium IS the
+      // entry, there's nothing to wait for.
+      const waitRequired = direction === "call" ? spot > zoneUpper : spot < zoneLower;
+      recommendedEntry = {
+        zoneLower,
+        zoneUpper,
+        referenceSpot: +zoneMid.toFixed(2),
+        estimatedPremium: +atZone.price.toFixed(2),
+        waitRequired,
+        note: waitRequired
+          ? `Estimated value if price pulls back into the marked ${zoneLower}-${zoneUpper} zone, using today's IV — a theoretical projection, not a live quote or a guaranteed fill price.`
+          : `Price is already at or through the marked ${zoneLower}-${zoneUpper} zone, so there's no pullback left to wait for — the current premium above is the real entry reference.`,
+      };
+    }
+
+    res.json({
+      direction,
+      spot,
+      target: target || null,
+      daysToExpiration: dte,
+      assumedDaysElapsedForTarget: target ? elapsedAssumed : null,
+      entryZone: chart && chart.entryZoneLower != null ? { lower: chart.entryZoneLower, upper: chart.entryZoneUpper } : null,
+      recommendedStrike: best,
+      recommendedEntry,
+      allStrikesRanked: ranked.sort((a, b) => a.strike - b.strike),
+      impliedRange,
+      ladder,
+      chartConfidence: chart ? chart.confidence : "no chart provided",
+      notes: [
+        chart && chart.notes,
+        !target ? "No target level was read from the chart — ranking by near-the-money delta instead of estimated return." : null,
+        droppedCount > 0 ? `Discarded ${droppedCount} strike(s) with a quoted premium below their own intrinsic value — likely a misread from the screenshot, not a real quote.` : null,
+      ].filter(Boolean),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Server error" });
+  }
+});
+ 
+const WATCH_SYSTEM_PROMPT = `You are silently watching a trader's live TradingView
+chart, checked periodically. You use Smart Money Concepts: CHoCH, BOS, Fair
+Value Gaps, Order Blocks, liquidity sweeps.
+ 
+You will be given the current chart screenshot and a short text summary of
+what you noted last time you checked (may be empty if this is the first check).
+ 
+Decide: has anything actually changed or become newly significant since last
+time — a new CHoCH, a BOS confirming, price sweeping a marked liquidity
+level, price entering or rejecting a marked FVG/OB zone, or a similarly
+concrete structural event? Do NOT alert for ordinary candle-to-candle price
+wiggling with no structural significance.
+ 
+Respond with ONLY a JSON object, no other text, no markdown fences:
+{
+  "alert": true or false,
+  "summary": "one short sentence capturing the current state, to compare against next time",
+  "message": "if alert is true, a short spoken-style sentence telling the trader what just happened. Empty string if alert is false."
+}`;
+ 
+app.post("/watch", async (req, res) => {
+  try {
+    const { image, lastState } = req.body;
+    if (!image) return res.status(400).json({ error: "No image provided" });
+ 
+    const match = image.match(/^data:(image\/\w+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: "Bad image format" });
+    const [, mediaType, base64Data] = match;
+ 
+    async function watchOnce() {
+      const message = await anthropic.messages.create({
+        model: "claude-sonnet-5",
+        max_tokens: 1000,
+        system: WATCH_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } },
+              { type: "text", text: "Last noted state: " + (lastState || "(none yet, first check)") },
+            ],
+          },
+        ],
+      });
+ 
+      const raw = message.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("")
+        .trim()
+        .replace(/^```json\s*|\s*```$/g, "");
+ 
+      if (!raw) {
+        const diag = `Claude returned no text (stop_reason: ${message.stop_reason}, content blocks: ${message.content.map((b) => b.type).join(",") || "none"}).`;
+        console.error("Empty response from /watch.", diag);
+        throw new Error(diag);
+      }
+      return raw;
+    }
+ 
+    // Retry once on a genuinely empty response before falling back to the
+    // safe no-alert default — same one-off-glitch handling as /trade-plan's
+    // extraction calls. A response that comes back non-empty but isn't
+    // valid JSON is a different failure (prompt/format drift, not a
+    // transient empty response), so that case still fails safe below
+    // without retrying.
+    let raw;
+    try {
+      raw = await watchOnce();
+    } catch (firstErr) {
+      console.error("First /watch attempt failed, retrying once:", firstErr.message);
+      try {
+        raw = await watchOnce();
+      } catch (secondErr) {
+        console.error("Second /watch attempt also failed, failing safe:", secondErr.message);
+        return res.json({ alert: false, summary: lastState || "", message: "" });
+      }
+    }
+ 
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      // If Claude ever drifts from pure JSON, fail safe: no alert, keep old state.
+      console.error("Failed to parse /watch JSON. Raw text was:", raw);
+      parsed = { alert: false, summary: lastState || "", message: "" };
+    }
+ 
+    res.json(parsed);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || "Server error" });
+  }
+});
+ 
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Listening on port " + PORT));
