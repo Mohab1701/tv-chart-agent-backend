@@ -344,7 +344,15 @@ app.post("/trade-plan", async (req, res) => {
     if (!target && best) {
       const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
       const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
-      const expectedMove = spot * sigma * Math.sqrt(Tentry);
+      // On a same-day (0 DTE) expiry, Tentry is exactly 0, which would
+      // collapse this to a $0 expected move regardless of IV — technically
+      // "correct" (0 days left = 0 variance under this model) but useless,
+      // since a 0 DTE index option still has real intraday movement left
+      // before the close. Same neutral-placeholder philosophy as the
+      // halfway-elapsed assumption above: assume half a trading day of
+      // time remains for this specific calculation, rather than none.
+      const TentryForMove = dte > 0 ? Tentry : 0.5 / 365;
+      const expectedMove = spot * sigma * Math.sqrt(TentryForMove);
       const upSpot = spot + expectedMove;
       const downSpot = spot - expectedMove;
       const upVal = blackScholes(upSpot, best.strike, Tremain, r, sigma, direction).price;
@@ -357,15 +365,51 @@ app.post("/trade-plan", async (req, res) => {
     }
  
     const ladder = best ? initialLadder(best.entryPremium) : null;
- 
+
+    // Optional "wait for a pullback" reference price: only computed when the
+    // chart actually has a marked FVG/Order Block entry zone. This is a
+    // Black-Scholes ESTIMATE of what the recommended strike would be worth
+    // if price pulls back into that zone — using today's IV at a
+    // hypothetical spot, not a live quote from the chain and not a
+    // guarantee the option trades there if/when price arrives. The current
+    // premium (recommendedStrike.entryPremium) is always the real, live
+    // price right now; this is only a "here's roughly what it'd cost if
+    // your marked zone gets hit" reference, not a replacement for it.
+    let recommendedEntry = null;
+    if (best && chart && chart.entryZoneLower != null && chart.entryZoneUpper != null) {
+      const zoneLower = chart.entryZoneLower;
+      const zoneUpper = chart.entryZoneUpper;
+      const zoneMid = (zoneLower + zoneUpper) / 2;
+      const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
+      const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
+      const atZone = blackScholes(zoneMid, best.strike, Tentry, r, sigma, direction);
+      // A call's demand zone normally sits below spot (price dips in before
+      // continuing up); a put's supply zone normally sits above spot. Only
+      // call this an actual "wait" if price hasn't reached the zone yet —
+      // if it's already there or through it, the current premium IS the
+      // entry, there's nothing to wait for.
+      const waitRequired = direction === "call" ? spot > zoneUpper : spot < zoneLower;
+      recommendedEntry = {
+        zoneLower,
+        zoneUpper,
+        referenceSpot: +zoneMid.toFixed(2),
+        estimatedPremium: +atZone.price.toFixed(2),
+        waitRequired,
+        note: waitRequired
+          ? `Estimated value if price pulls back into the marked ${zoneLower}-${zoneUpper} zone, using today's IV — a theoretical projection, not a live quote or a guaranteed fill price.`
+          : `Price is already at or through the marked ${zoneLower}-${zoneUpper} zone, so there's no pullback left to wait for — the current premium above is the real entry reference.`,
+      };
+    }
+
     res.json({
       direction,
       spot,
       target: target || null,
       daysToExpiration: dte,
       assumedDaysElapsedForTarget: target ? elapsedAssumed : null,
-      entryZone: chart && chart.entryZoneLower ? { lower: chart.entryZoneLower, upper: chart.entryZoneUpper } : null,
+      entryZone: chart && chart.entryZoneLower != null ? { lower: chart.entryZoneLower, upper: chart.entryZoneUpper } : null,
       recommendedStrike: best,
+      recommendedEntry,
       allStrikesRanked: ranked.sort((a, b) => a.strike - b.strike),
       impliedRange,
       ladder,
