@@ -345,6 +345,23 @@ app.post("/trade-plan", async (req, res) => {
     const r = 0.043;
     const liquidityThreshold = liquidityThresholdFor(chain.symbol);
 
+    // On a same-day (0 DTE) expiry, both Tentry and Tremain above are
+    // EXACTLY 0. Black-Scholes with T=0 isn't an approximation at that
+    // point — it's defined to collapse to pure intrinsic value, which turns
+    // delta into a step function (-1 / 0 / +1 depending only on which side
+    // of the strike spot sits) and wipes out all time value from every
+    // premium estimate, even though a 0 DTE option still has real hours of
+    // trading and real extrinsic value left before the close. This showed
+    // up concretely as delta=-1, "Est. return @ target: 100%", and "Est.
+    // premium in zone: $0" on a real 0 DTE trade plan — all three are
+    // artifacts of T=0, not real numbers. Every place that prices an
+    // option off "now" or "the assumed halfway point" uses this floor
+    // instead of the raw (possibly-zero) dte-based time on 0 DTE chains;
+    // Tremain's floor is half of Tentry's, preserving the same "half the
+    // remaining time has elapsed" assumption used for multi-day expiries.
+    const TentryEff = dte > 0 ? Tentry : 0.5 / 365;
+    const TremainEff = dte > 0 ? Tremain : 0.25 / 365;
+
     let droppedForBadData = 0;
     let droppedForLiquidity = 0;
 
@@ -352,7 +369,7 @@ app.post("/trade-plan", async (req, res) => {
       .filter((s) => s.strike > 0)
       .map((s) => {
         const sigma = Math.max(s.ivPct ?? 20, 0.01) / 100;
-        const entryCalc = blackScholes(spot, s.strike, Tentry, r, sigma, direction);
+        const entryCalc = blackScholes(spot, s.strike, TentryEff, r, sigma, direction);
         const entryPremium = s.bid ?? entryCalc.price;
 
         // Sanity check: a real premium can never be below its own intrinsic
@@ -385,7 +402,7 @@ app.post("/trade-plan", async (req, res) => {
         let ret = null;
         let worthlessAtTarget = false;
         if (target) {
-          const atTarget = blackScholes(target, s.strike, Tremain, r, sigma, direction);
+          const atTarget = blackScholes(target, s.strike, TremainEff, r, sigma, direction);
           // A strike that would be flat-out worthless AT the target itself
           // (out of the money even in the scenario where the target is
           // actually hit) is never a legitimate "best" pick for that
@@ -442,19 +459,13 @@ app.post("/trade-plan", async (req, res) => {
     if (!target && best) {
       const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
       const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
-      // On a same-day (0 DTE) expiry, Tentry is exactly 0, which would
-      // collapse this to a $0 expected move regardless of IV — technically
-      // "correct" (0 days left = 0 variance under this model) but useless,
-      // since a 0 DTE index option still has real intraday movement left
-      // before the close. Same neutral-placeholder philosophy as the
-      // halfway-elapsed assumption above: assume half a trading day of
-      // time remains for this specific calculation, rather than none.
-      const TentryForMove = dte > 0 ? Tentry : 0.5 / 365;
-      const expectedMove = spot * sigma * Math.sqrt(TentryForMove);
+      // Uses TentryEff (see above) so a 0 DTE chart still gets a real
+      // expected-move magnitude instead of collapsing to $0.
+      const expectedMove = spot * sigma * Math.sqrt(TentryEff);
       const upSpot = spot + expectedMove;
       const downSpot = spot - expectedMove;
-      const upVal = blackScholes(upSpot, best.strike, Tremain, r, sigma, direction).price;
-      const downVal = blackScholes(downSpot, best.strike, Tremain, r, sigma, direction).price;
+      const upVal = blackScholes(upSpot, best.strike, TremainEff, r, sigma, direction).price;
+      const downVal = blackScholes(downSpot, best.strike, TremainEff, r, sigma, direction).price;
       impliedRange = {
         expectedMovePoints: +expectedMove.toFixed(2),
         ifUp: { spot: +upSpot.toFixed(2), premium: +upVal.toFixed(2) },
@@ -480,7 +491,7 @@ app.post("/trade-plan", async (req, res) => {
       const zoneMid = (zoneLower + zoneUpper) / 2;
       const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
       const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
-      const atZone = blackScholes(zoneMid, best.strike, Tentry, r, sigma, direction);
+      const atZone = blackScholes(zoneMid, best.strike, TentryEff, r, sigma, direction);
       // A call's demand zone normally sits below spot (price dips in before
       // continuing up); a put's supply zone normally sits above spot. Only
       // call this an actual "wait" if price hasn't reached the zone yet —
