@@ -66,7 +66,38 @@ function initialLadder(entryPremium) {
     trailStepPct: 20,
   };
 }
- 
+
+// ---- Per-symbol liquidity thresholds (hard filter, /trade-plan only) -----
+// A strike gets discarded before ranking if its volume OR open interest
+// comes in below its symbol's threshold here — same principle as the
+// bad-data intrinsic-value check: a real edge on paper doesn't help if the
+// strike itself is too thin to fill without real slippage.
+//
+// These starting numbers come from researched options-liquidity
+// conventions, NOT from live Sahm data for these specific tickers — they're
+// deliberately conservative (favor discarding a borderline strike over
+// letting through something actually illiquid), since this feeds a real
+// trade recommendation. Volume is weighted as the primary signal (open
+// interest is a secondary backstop): on 0 DTE contracts especially, open
+// interest is a stale, once-daily number, while volume reflects same-day
+// live activity. Add/adjust entries here as you trade more symbols — the
+// lookup is case-insensitive against chain.symbol, and anything not listed
+// falls through to DEFAULT.
+const LIQUIDITY_THRESHOLDS = {
+  SPX: { minVolume: 500, minOpenInterest: 1000 },
+  SPX500: { minVolume: 500, minOpenInterest: 1000 },
+  XSP: { minVolume: 500, minOpenInterest: 1000 },
+  NVDA: { minVolume: 100, minOpenInterest: 500 },
+  NFLX: { minVolume: 100, minOpenInterest: 500 },
+  TSLA: { minVolume: 100, minOpenInterest: 500 },
+  DEFAULT: { minVolume: 50, minOpenInterest: 200 },
+};
+function liquidityThresholdFor(symbol) {
+  if (!symbol) return LIQUIDITY_THRESHOLDS.DEFAULT;
+  const key = String(symbol).trim().toUpperCase();
+  return LIQUIDITY_THRESHOLDS[key] || LIQUIDITY_THRESHOLDS.DEFAULT;
+}
+
 const SYSTEM_PROMPT = `You are a trading chart analyst assistant. You are shown a
 screenshot of the user's live TradingView chart and, optionally, a question
 they asked (by voice or text). The user trades using Smart Money Concepts:
@@ -176,17 +207,22 @@ than guessing a number.`;
  
 const CHAIN_EXTRACT_PROMPT = `You are reading a screenshot of an options chain
 (from the Sahm trading app, UI is in Arabic — سعر التنفيذ = strike price,
-التقلب الضمني = implied volatility, سعر العرض = bid price). Today's date is
+التقلب الضمني = implied volatility, سعر العرض = bid price, الحجم = volume,
+الكمية غير إغلاق المركز = open interest). Today's date is
 ${new Date().toISOString().slice(0, 10)}. Extract what you can see and
 respond with ONLY a JSON object, no other text, no markdown fences:
 {
+  "symbol": "the ticker shown near the top of the screen (e.g. TSLA, NVDA, SPX), or null if not visible",
   "optionType": "call" or "put" or "unclear" (خيار الشراء = call, خيار البيع = put — check which SPECIFIC tab is selected. The Sahm chain view also has a third tab, الكل = "All", which shows both calls and puts together — if الكل is the one selected/highlighted, or you otherwise can't tell one specific side is chosen, use "unclear" rather than guessing call or put),
   "expirationDateText": "the expiration date shown, in whatever form you see it",
   "daysToExpiration": number (compute from today's date to the expiration shown; use 0 if it expires today),
   "underlyingSpot": number or null (if shown near the top of the screen),
-  "strikes": [ { "strike": number, "ivPct": number or null, "bid": number or null } ]
+  "strikes": [ { "strike": number, "ivPct": number or null, "bid": number or null, "volume": number or null, "openInterest": number or null } ]
 }
-List every strike row visible in the screenshot. If IV shows "--", use null for ivPct.`;
+List every strike row visible in the screenshot. If IV shows "--", use null for ivPct.
+Volume and open interest are often shown abbreviated (e.g. "59.67K" means
+59670, "2.80K" means 2800) — convert these to the full plain number, not
+the abbreviated text. Use null for either if that column isn't visible.`;
  
 app.post("/trade-plan", async (req, res) => {
   try {
@@ -296,21 +332,36 @@ app.post("/trade-plan", async (req, res) => {
     const elapsedAssumed = dte / 2;
     const Tremain = Math.max(dte - elapsedAssumed, 0) / 365;
     const r = 0.043;
- 
+    const liquidityThreshold = liquidityThresholdFor(chain.symbol);
+
+    let droppedForBadData = 0;
+    let droppedForLiquidity = 0;
+
     const ranked = (chain.strikes || [])
       .filter((s) => s.strike > 0)
       .map((s) => {
         const sigma = Math.max(s.ivPct ?? 20, 0.01) / 100;
         const entryCalc = blackScholes(spot, s.strike, Tentry, r, sigma, direction);
         const entryPremium = s.bid ?? entryCalc.price;
- 
+
         // Sanity check: a real premium can never be below its own intrinsic
         // value. If the quoted bid violates this, the vision extraction
         // almost certainly misread/misaligned this row — drop it rather
         // than let bad data produce a fake, huge "return %".
         const intrinsic = direction === "call" ? Math.max(spot - s.strike, 0) : Math.max(s.strike - spot, 0);
-        if (entryPremium < intrinsic - 0.01) return null;
- 
+        if (entryPremium < intrinsic - 0.01) { droppedForBadData++; return null; }
+
+        // Liquidity filter: discard a strike whose volume or open interest
+        // is below this symbol's threshold. A missing (null) reading isn't
+        // treated as a fail — the model may simply not have been able to
+        // read that column — only an actual number below the bar disqualifies.
+        const volume = s.volume ?? null;
+        const openInterest = s.openInterest ?? null;
+        const illiquid =
+          (volume !== null && volume < liquidityThreshold.minVolume) ||
+          (openInterest !== null && openInterest < liquidityThreshold.minOpenInterest);
+        if (illiquid) { droppedForLiquidity++; return null; }
+
         let ret = null;
         if (target) {
           const atTarget = blackScholes(target, s.strike, Tremain, r, sigma, direction);
@@ -319,6 +370,8 @@ app.post("/trade-plan", async (req, res) => {
         return {
           strike: s.strike,
           ivPct: s.ivPct,
+          volume,
+          openInterest,
           entryPremium: +entryPremium.toFixed(2),
           delta: +entryCalc.delta.toFixed(2),
           estimatedReturnPct: ret !== null ? +ret.toFixed(0) : null,
@@ -337,9 +390,6 @@ app.post("/trade-plan", async (req, res) => {
     if (!best && ranked.length) {
       best = ranked.reduce((a, b) => (Math.abs(Math.abs(b.delta) - 0.5) < Math.abs(Math.abs(a.delta) - 0.5) ? b : a));
     }
- 
-    const totalStrikesRead = (chain.strikes || []).filter((s) => s.strike > 0).length;
-    const droppedCount = totalStrikesRead - ranked.length;
  
     // No chart target? Fall back to the market's OWN implied expected move
     // (from the recommended strike's IV) rather than showing no exit
@@ -407,6 +457,7 @@ app.post("/trade-plan", async (req, res) => {
     }
 
     res.json({
+      symbol: chain.symbol || null,
       direction,
       spot,
       target: target || null,
@@ -418,11 +469,13 @@ app.post("/trade-plan", async (req, res) => {
       allStrikesRanked: ranked.sort((a, b) => a.strike - b.strike),
       impliedRange,
       ladder,
+      liquidityThreshold,
       chartConfidence: chart ? chart.confidence : "no chart provided",
       notes: [
         chart && chart.notes,
         !target ? "No target level was read from the chart — ranking by near-the-money delta instead of estimated return." : null,
-        droppedCount > 0 ? `Discarded ${droppedCount} strike(s) with a quoted premium below their own intrinsic value — likely a misread from the screenshot, not a real quote.` : null,
+        droppedForBadData > 0 ? `Discarded ${droppedForBadData} strike(s) with a quoted premium below their own intrinsic value — likely a misread from the screenshot, not a real quote.` : null,
+        droppedForLiquidity > 0 ? `Discarded ${droppedForLiquidity} strike(s) below the liquidity bar for ${chain.symbol || "this symbol"} (min volume ${liquidityThreshold.minVolume}, min open interest ${liquidityThreshold.minOpenInterest}) — too thin to safely fill.` : null,
       ].filter(Boolean),
     });
   } catch (err) {
