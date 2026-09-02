@@ -314,7 +314,18 @@ app.post("/trade-plan", async (req, res) => {
       (chart && chart.direction !== "unclear" && chart.direction) ||
       "call";
     const spot = (chart && chart.spot) || chain.underlyingSpot;
-    const target = chart && chart.targetLevel;
+
+    // Sanity check: a target level identical (or essentially identical) to
+    // the current spot price can't be a real target — it would mean "no
+    // expected move," which defeats the whole point of marking one. This
+    // specific failure mode (targetLevel misread as equal to spot, even
+    // when the chart's own prose notes described a different level
+    // entirely) has shown up more than once in real use, so treat it as an
+    // invalid read rather than trusting it — falls back to the same
+    // no-target behavior as if the chart never had a marked level at all.
+    const rawTarget = chart && chart.targetLevel;
+    const targetEqualsSpot = rawTarget != null && spot != null && Math.abs(rawTarget - spot) < 0.05;
+    const target = targetEqualsSpot ? null : rawTarget;
     const dte = Math.max(chain.daysToExpiration ?? 0, 0);
  
     if (!spot) {
@@ -474,6 +485,7 @@ app.post("/trade-plan", async (req, res) => {
       notes: [
         chart && chart.notes,
         !target ? "No target level was read from the chart — ranking by near-the-money delta instead of estimated return." : null,
+        targetEqualsSpot ? `Ignored a marked target that read as identical to the current spot price (${rawTarget}) — almost certainly a misread, not a real target.` : null,
         droppedForBadData > 0 ? `Discarded ${droppedForBadData} strike(s) with a quoted premium below their own intrinsic value — likely a misread from the screenshot, not a real quote.` : null,
         droppedForLiquidity > 0 ? `Discarded ${droppedForLiquidity} strike(s) below the liquidity bar for ${chain.symbol || "this symbol"} (min volume ${liquidityThreshold.minVolume}, min open interest ${liquidityThreshold.minOpenInterest}) — too thin to safely fill.` : null,
       ].filter(Boolean),
