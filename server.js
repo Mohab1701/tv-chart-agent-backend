@@ -362,20 +362,38 @@ app.post("/trade-plan", async (req, res) => {
         const intrinsic = direction === "call" ? Math.max(spot - s.strike, 0) : Math.max(s.strike - spot, 0);
         if (entryPremium < intrinsic - 0.01) { droppedForBadData++; return null; }
 
-        // Liquidity filter: discard a strike whose volume or open interest
-        // is below this symbol's threshold. A missing (null) reading isn't
-        // treated as a fail — the model may simply not have been able to
-        // read that column — only an actual number below the bar disqualifies.
+        // Liquidity filter: discard a strike whose volume (and, for
+        // multi-day expiries, open interest) is below this symbol's
+        // threshold. A missing (null) reading isn't treated as a fail — the
+        // model may simply not have been able to read that column — only an
+        // actual number below the bar disqualifies.
+        //
+        // Open interest is NOT checked for 0 DTE (same-day expiry) chains.
+        // OI is a once-daily, start-of-session snapshot — on an expiry's
+        // last trading day it's stale by definition and doesn't reflect
+        // same-day activity, so real 0DTE liquidity shows up in volume, not
+        // OI (this is standard for SPX/XSP-style daily-expiry index
+        // options). Requiring a high OI floor on 0DTE chains was discarding
+        // strikes that were actually liquid all session.
         const volume = s.volume ?? null;
         const openInterest = s.openInterest ?? null;
         const illiquid =
           (volume !== null && volume < liquidityThreshold.minVolume) ||
-          (openInterest !== null && openInterest < liquidityThreshold.minOpenInterest);
+          (dte > 0 && openInterest !== null && openInterest < liquidityThreshold.minOpenInterest);
         if (illiquid) { droppedForLiquidity++; return null; }
 
         let ret = null;
+        let worthlessAtTarget = false;
         if (target) {
           const atTarget = blackScholes(target, s.strike, Tremain, r, sigma, direction);
+          // A strike that would be flat-out worthless AT the target itself
+          // (out of the money even in the scenario where the target is
+          // actually hit) is never a legitimate "best" pick for that
+          // target, no matter how its return % compares to other worthless
+          // strikes — it just means the target is on the wrong side of
+          // this strike entirely. Flagged separately so ranking can refuse
+          // to call this "the best" without at least noting it.
+          worthlessAtTarget = atTarget.price <= 0.01;
           ret = entryPremium > 0.01 ? ((atTarget.price - entryPremium) / entryPremium) * 100 : null;
         }
         return {
@@ -386,17 +404,31 @@ app.post("/trade-plan", async (req, res) => {
           entryPremium: +entryPremium.toFixed(2),
           delta: +entryCalc.delta.toFixed(2),
           estimatedReturnPct: ret !== null ? +ret.toFixed(0) : null,
+          worthlessAtTarget,
         };
       })
       .filter(Boolean);
- 
+
     // Rank: prefer real target-based return if we have a target; otherwise
     // prefer strikes closest to at-the-money (delta closest to 0.5 magnitude)
     // since that's the safer default for 0-3 DTE per our earlier discussion.
     let best = null;
+    let targetUnreachableForAllStrikes = false;
     if (target) {
-      const withReturn = ranked.filter((s) => s.estimatedReturnPct !== null);
-      if (withReturn.length) best = withReturn.reduce((a, b) => (b.estimatedReturnPct > a.estimatedReturnPct ? b : a));
+      // Only strikes that would actually have real value AT the target are
+      // legitimate candidates for a target-based "best" pick — a strike
+      // that's worthless there isn't a good target play just because its
+      // (still negative) return beats another worthless strike's.
+      const withReturn = ranked.filter((s) => s.estimatedReturnPct !== null && !s.worthlessAtTarget);
+      if (withReturn.length) {
+        best = withReturn.reduce((a, b) => (b.estimatedReturnPct > a.estimatedReturnPct ? b : a));
+      } else if (ranked.some((s) => s.estimatedReturnPct !== null)) {
+        // Every strike we could evaluate against this target would expire
+        // worthless there — none of them is a real target play. Fall
+        // through to the near-the-money fallback below, same as the
+        // no-target case, but flag it so the response can say why.
+        targetUnreachableForAllStrikes = true;
+      }
     }
     if (!best && ranked.length) {
       best = ranked.reduce((a, b) => (Math.abs(Math.abs(b.delta) - 0.5) < Math.abs(Math.abs(a.delta) - 0.5) ? b : a));
@@ -486,8 +518,9 @@ app.post("/trade-plan", async (req, res) => {
         chart && chart.notes,
         !target ? "No target level was read from the chart — ranking by near-the-money delta instead of estimated return." : null,
         targetEqualsSpot ? `Ignored a marked target that read as identical to the current spot price (${rawTarget}) — almost certainly a misread, not a real target.` : null,
+        targetUnreachableForAllStrikes ? `Every strike that could be evaluated against the ${target} target would still expire worthless even if that target is hit exactly — none of them is a real target play. Falling back to the nearest-the-money strike instead; treat this pick as a directional bet, not a target-based recommendation.` : null,
         droppedForBadData > 0 ? `Discarded ${droppedForBadData} strike(s) with a quoted premium below their own intrinsic value — likely a misread from the screenshot, not a real quote.` : null,
-        droppedForLiquidity > 0 ? `Discarded ${droppedForLiquidity} strike(s) below the liquidity bar for ${chain.symbol || "this symbol"} (min volume ${liquidityThreshold.minVolume}, min open interest ${liquidityThreshold.minOpenInterest}) — too thin to safely fill.` : null,
+        droppedForLiquidity > 0 ? `Discarded ${droppedForLiquidity} strike(s) below the liquidity bar for ${chain.symbol || "this symbol"} (min volume ${liquidityThreshold.minVolume}${dte > 0 ? `, min open interest ${liquidityThreshold.minOpenInterest}` : " — open interest not checked on 0DTE chains, it's a stale start-of-day number"}) — too thin to safely fill.` : null,
       ].filter(Boolean),
     });
   } catch (err) {
