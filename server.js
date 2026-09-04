@@ -206,30 +206,45 @@ If no zone or target is marked on the chart, use null for those fields rather
 than guessing a number.`;
  
 const CHAIN_EXTRACT_PROMPT = `You are reading a screenshot of an options chain
-(from the Sahm trading app, UI is in Arabic — سعر التنفيذ = strike price,
-التقلب الضمني = implied volatility, الحجم = volume,
-الكمية غير إغلاق المركز = open interest). There are two separate price
-columns per side, and they are easy to mix up — get this right:
-سعر الطلب (literally "the demand/request price") is the BID — what a buyer
-is offering to pay. سعر العرض (literally "the offer/supply price") is the
-ASK — what a seller wants to receive. The ask is always the higher of the
-two numbers on any given row; use that to sanity-check yourself if the
-labels are hard to read. Today's date is
-${new Date().toISOString().slice(0, 10)}. Extract what you can see and
-respond with ONLY a JSON object, no other text, no markdown fences:
+(from the Sahm trading app — UI may be in Arabic or English. In Arabic:
+سعر التنفيذ = strike price, التقلب الضمني = implied volatility, الحجم =
+volume, الكمية غير إغلاق المركز = open interest, سعر الطلب (literally
+"demand/request price") = BID, سعر العرض (literally "offer/supply price")
+= ASK — the ask is always the higher of the two on any row, use that to
+sanity-check yourself. In English the chain shows "Bid Price" / "Ask
+Price" directly).
+
+IMPORTANT — this chain view can show CALLS and PUTS as two separate blocks
+of columns on the same screen at once (an "All" / الكل view, with calls
+typically on one side of the strike column and puts on the other, each
+side with its OWN bid/ask/volume/open-interest/IV/delta). Never merge or
+average the two sides, and never report one side's numbers as if they were
+the other's — extract each strike's call data and put data SEPARATELY,
+each into its own object, even if you only need one side for this
+analysis. If a given side isn't shown at all for a strike (e.g. only a
+Calls-only or Puts-only tab is open), set that entire side's object to
+null rather than guessing or leaving individual fields blank.
+
+Today's date is ${new Date().toISOString().slice(0, 10)}. Extract what you
+can see and respond with ONLY a JSON object, no other text, no markdown
+fences:
 {
   "symbol": "the ticker shown near the top of the screen (e.g. TSLA, NVDA, SPX), or null if not visible",
-  "optionType": "call" or "put" or "unclear" (خيار الشراء = call, خيار البيع = put — check which SPECIFIC tab is selected. The Sahm chain view also has a third tab, الكل = "All", which shows both calls and puts together — if الكل is the one selected/highlighted, or you otherwise can't tell one specific side is chosen, use "unclear" rather than guessing call or put),
+  "optionType": "call" or "put" or "unclear" (خيار الشراء = call, خيار البيع = put — check which SPECIFIC tab is selected: Calls-only, Puts-only, or All/الكل. If it's the All/الكل view showing both sides at once, or you otherwise can't tell one specific side is the intended focus, use "unclear" rather than guessing — this is independent of the fact that you should still extract BOTH sides' data below when both are visible),
   "expirationDateText": "the expiration date shown, in whatever form you see it",
   "daysToExpiration": number (compute from today's date to the expiration shown; use 0 if it expires today),
   "underlyingSpot": number or null (if shown near the top of the screen),
-  "strikes": [ { "strike": number, "ivPct": number or null, "bid": number or null, "ask": number or null, "volume": number or null, "openInterest": number or null } ]
+  "strikes": [ { "strike": number,
+    "call": { "ivPct": number or null, "bid": number or null, "ask": number or null, "volume": number or null, "openInterest": number or null } or null,
+    "put": { "ivPct": number or null, "bid": number or null, "ask": number or null, "volume": number or null, "openInterest": number or null } or null
+  } ]
 }
-List every strike row visible in the screenshot. If IV shows "--", use null for ivPct.
-Volume and open interest are often shown abbreviated (e.g. "59.67K" means
-59670, "2.80K" means 2800) — convert these to the full plain number, not
-the abbreviated text. Use null for bid, ask, volume, or open interest if
-that column isn't visible.`;
+List every strike row visible in the screenshot. If IV shows "--", use null
+for ivPct. Volume and open interest are often shown abbreviated (e.g.
+"59.67K" means 59670, "2.80K" means 2800) — convert these to the full
+plain number, not the abbreviated text. Use null for any individual field
+that isn't visible, and null for the whole call/put object if that entire
+side isn't shown for this strike.`;
  
 app.post("/trade-plan", async (req, res) => {
   try {
@@ -371,18 +386,34 @@ app.post("/trade-plan", async (req, res) => {
 
     let droppedForBadData = 0;
     let droppedForLiquidity = 0;
+    let droppedForMissingSide = 0;
 
     const ranked = (chain.strikes || [])
       .filter((s) => s.strike > 0)
       .map((s) => {
-        const sigma = Math.max(s.ivPct ?? 20, 0.01) / 100;
+        // The chain now carries call and put data separately per strike
+        // (see CHAIN_EXTRACT_PROMPT) specifically because a Sahm "All"
+        // view shows both sides on screen at once — trusting a single
+        // flat set of fields per strike meant a PUT recommendation could
+        // silently get priced off the CALL column (confirmed on a real
+        // NFLX screenshot: recommended premium was the call's ask, not
+        // the put's). Pick the side that matches the direction we're
+        // actually trading, and skip the strike entirely if that side
+        // wasn't visible/extracted at all rather than guessing.
+        const side = direction === "call" ? s.call : s.put;
+        if (!side) {
+          droppedForMissingSide++;
+          return null;
+        }
+
+        const sigma = Math.max(side.ivPct ?? 20, 0.01) / 100;
         const entryCalc = blackScholes(spot, s.strike, TentryEff, r, sigma, direction);
         // Entry premium is what you'd actually pay to OPEN this position —
         // every recommendation here is for buying, so that's the ask, not
         // the bid (the bid is what you'd receive selling). Fall back to bid
         // only if the ask genuinely wasn't readable, and to the theoretical
         // price only if neither was.
-        const entryPremium = s.ask ?? s.bid ?? entryCalc.price;
+        const entryPremium = side.ask ?? side.bid ?? entryCalc.price;
 
         // Sanity check: a real premium can never be below its own intrinsic
         // value. If the quoted ask/bid violates this, the vision extraction
@@ -404,8 +435,8 @@ app.post("/trade-plan", async (req, res) => {
         // OI (this is standard for SPX/XSP-style daily-expiry index
         // options). Requiring a high OI floor on 0DTE chains was discarding
         // strikes that were actually liquid all session.
-        const volume = s.volume ?? null;
-        const openInterest = s.openInterest ?? null;
+        const volume = side.volume ?? null;
+        const openInterest = side.openInterest ?? null;
         const illiquid =
           (volume !== null && volume < liquidityThreshold.minVolume) ||
           (dte > 0 && openInterest !== null && openInterest < liquidityThreshold.minOpenInterest);
@@ -427,13 +458,13 @@ app.post("/trade-plan", async (req, res) => {
         }
         return {
           strike: s.strike,
-          ivPct: s.ivPct,
+          ivPct: side.ivPct,
           volume,
           openInterest,
-          bid: s.bid ?? null,
-          ask: s.ask ?? null,
+          bid: side.bid ?? null,
+          ask: side.ask ?? null,
           entryPremium: +entryPremium.toFixed(2),
-          entryPremiumSource: s.ask != null ? "ask" : s.bid != null ? "bid" : "theoretical",
+          entryPremiumSource: side.ask != null ? "ask" : side.bid != null ? "bid" : "theoretical",
           delta: +entryCalc.delta.toFixed(2),
           estimatedReturnPct: ret !== null ? +ret.toFixed(0) : null,
           worthlessAtTarget,
@@ -472,8 +503,9 @@ app.post("/trade-plan", async (req, res) => {
     // guessed price — but it's a range, not a prediction of direction.
     let impliedRange = null;
     if (!target && best) {
-      const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
-      const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
+      // best.ivPct already came from the correct call/put side (set when
+      // `ranked` was built) — no need to re-look-up the raw chain data.
+      const sigma = Math.max(best.ivPct ?? 20, 0.01) / 100;
       // Uses TentryEff (see above) so a 0 DTE chart still gets a real
       // expected-move magnitude instead of collapsing to $0.
       const expectedMove = spot * sigma * Math.sqrt(TentryEff);
@@ -504,8 +536,8 @@ app.post("/trade-plan", async (req, res) => {
       const zoneLower = chart.entryZoneLower;
       const zoneUpper = chart.entryZoneUpper;
       const zoneMid = (zoneLower + zoneUpper) / 2;
-      const bestStrikeData = chain.strikes.find((s) => s.strike === best.strike);
-      const sigma = Math.max((bestStrikeData && bestStrikeData.ivPct) ?? 20, 0.01) / 100;
+      // best.ivPct already came from the correct call/put side.
+      const sigma = Math.max(best.ivPct ?? 20, 0.01) / 100;
       const atZone = blackScholes(zoneMid, best.strike, TentryEff, r, sigma, direction);
       // A call's demand zone normally sits below spot (price dips in before
       // continuing up); a put's supply zone normally sits above spot. Only
@@ -582,6 +614,7 @@ app.post("/trade-plan", async (req, res) => {
         targetUnreachableForAllStrikes ? `Every strike that could be evaluated against the ${target} target would still expire worthless even if that target is hit exactly — none of them is a real target play. Falling back to the nearest-the-money strike instead; treat this pick as a directional bet, not a target-based recommendation.` : null,
         droppedForBadData > 0 ? `Discarded ${droppedForBadData} strike(s) with a quoted premium below their own intrinsic value — likely a misread from the screenshot, not a real quote.` : null,
         droppedForLiquidity > 0 ? `Discarded ${droppedForLiquidity} strike(s) below the liquidity bar for ${chain.symbol || "this symbol"} (min volume ${liquidityThreshold.minVolume}${dte > 0 ? `, min open interest ${liquidityThreshold.minOpenInterest}` : " — open interest not checked on 0DTE chains, it's a stale start-of-day number"}) — too thin to safely fill.` : null,
+        droppedForMissingSide > 0 ? `Discarded ${droppedForMissingSide} strike(s) with no readable ${direction} data on the chain screenshot — if this number looks high, the ${direction} side may not actually have been visible (e.g. a Calls-only or Puts-only tab open on the wrong side, or a cropped screenshot).` : null,
       ].filter(Boolean),
     });
   } catch (err) {
