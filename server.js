@@ -207,8 +207,14 @@ than guessing a number.`;
  
 const CHAIN_EXTRACT_PROMPT = `You are reading a screenshot of an options chain
 (from the Sahm trading app, UI is in Arabic — سعر التنفيذ = strike price,
-التقلب الضمني = implied volatility, سعر العرض = bid price, الحجم = volume,
-الكمية غير إغلاق المركز = open interest). Today's date is
+التقلب الضمني = implied volatility, الحجم = volume,
+الكمية غير إغلاق المركز = open interest). There are two separate price
+columns per side, and they are easy to mix up — get this right:
+سعر الطلب (literally "the demand/request price") is the BID — what a buyer
+is offering to pay. سعر العرض (literally "the offer/supply price") is the
+ASK — what a seller wants to receive. The ask is always the higher of the
+two numbers on any given row; use that to sanity-check yourself if the
+labels are hard to read. Today's date is
 ${new Date().toISOString().slice(0, 10)}. Extract what you can see and
 respond with ONLY a JSON object, no other text, no markdown fences:
 {
@@ -217,12 +223,13 @@ respond with ONLY a JSON object, no other text, no markdown fences:
   "expirationDateText": "the expiration date shown, in whatever form you see it",
   "daysToExpiration": number (compute from today's date to the expiration shown; use 0 if it expires today),
   "underlyingSpot": number or null (if shown near the top of the screen),
-  "strikes": [ { "strike": number, "ivPct": number or null, "bid": number or null, "volume": number or null, "openInterest": number or null } ]
+  "strikes": [ { "strike": number, "ivPct": number or null, "bid": number or null, "ask": number or null, "volume": number or null, "openInterest": number or null } ]
 }
 List every strike row visible in the screenshot. If IV shows "--", use null for ivPct.
 Volume and open interest are often shown abbreviated (e.g. "59.67K" means
 59670, "2.80K" means 2800) — convert these to the full plain number, not
-the abbreviated text. Use null for either if that column isn't visible.`;
+the abbreviated text. Use null for bid, ask, volume, or open interest if
+that column isn't visible.`;
  
 app.post("/trade-plan", async (req, res) => {
   try {
@@ -370,10 +377,15 @@ app.post("/trade-plan", async (req, res) => {
       .map((s) => {
         const sigma = Math.max(s.ivPct ?? 20, 0.01) / 100;
         const entryCalc = blackScholes(spot, s.strike, TentryEff, r, sigma, direction);
-        const entryPremium = s.bid ?? entryCalc.price;
+        // Entry premium is what you'd actually pay to OPEN this position —
+        // every recommendation here is for buying, so that's the ask, not
+        // the bid (the bid is what you'd receive selling). Fall back to bid
+        // only if the ask genuinely wasn't readable, and to the theoretical
+        // price only if neither was.
+        const entryPremium = s.ask ?? s.bid ?? entryCalc.price;
 
         // Sanity check: a real premium can never be below its own intrinsic
-        // value. If the quoted bid violates this, the vision extraction
+        // value. If the quoted ask/bid violates this, the vision extraction
         // almost certainly misread/misaligned this row — drop it rather
         // than let bad data produce a fake, huge "return %".
         const intrinsic = direction === "call" ? Math.max(spot - s.strike, 0) : Math.max(s.strike - spot, 0);
@@ -418,7 +430,10 @@ app.post("/trade-plan", async (req, res) => {
           ivPct: s.ivPct,
           volume,
           openInterest,
+          bid: s.bid ?? null,
+          ask: s.ask ?? null,
           entryPremium: +entryPremium.toFixed(2),
+          entryPremiumSource: s.ask != null ? "ask" : s.bid != null ? "bid" : "theoretical",
           delta: +entryCalc.delta.toFixed(2),
           estimatedReturnPct: ret !== null ? +ret.toFixed(0) : null,
           worthlessAtTarget,
@@ -498,12 +513,47 @@ app.post("/trade-plan", async (req, res) => {
       // if it's already there or through it, the current premium IS the
       // entry, there's nothing to wait for.
       const waitRequired = direction === "call" ? spot > zoneUpper : spot < zoneLower;
+
+      // When the zone is genuinely far from today's recommended strike, that
+      // strike is often close to worthless AT the zone (this is common —
+      // the recommended strike is picked for the CURRENT spot, but the zone
+      // is wherever the chart's FVG/Order Block happens to sit, which can be
+      // well away from it). Showing "$0.00" with no context there isn't
+      // useful — the real answer is "this isn't the strike to buy once
+      // price actually gets there." So whenever a wait is required, also
+      // scan the same liquidity/data-quality-filtered strike list and find
+      // whichever one would actually be near-the-money AT the zone's
+      // midpoint — the strike someone should actually be looking at if/when
+      // price reaches that zone, not necessarily the one recommended for
+      // right now.
+      let betterStrikeForZone = null;
+      if (waitRequired && ranked.length) {
+        const atZoneCandidates = ranked.map((s) => {
+          const sigma = Math.max(s.ivPct ?? 20, 0.01) / 100;
+          const calc = blackScholes(zoneMid, s.strike, TentryEff, r, sigma, direction);
+          return { strike: s.strike, price: calc.price, delta: calc.delta };
+        });
+        const zoneBest = atZoneCandidates.reduce((a, b) =>
+          Math.abs(Math.abs(b.delta) - 0.5) < Math.abs(Math.abs(a.delta) - 0.5) ? b : a
+        );
+        betterStrikeForZone = {
+          strike: zoneBest.strike,
+          estimatedPremium: +zoneBest.price.toFixed(2),
+          delta: +zoneBest.delta.toFixed(2),
+          sameAsCurrentPick: zoneBest.strike === best.strike,
+          note: zoneBest.strike === best.strike
+            ? `Strike ${zoneBest.strike} (today's recommended pick) is still the closest to at-the-money at the zone's midpoint (${zoneMid.toFixed(1)}) too — no change needed if/when price gets there.`
+            : `Strike ${zoneBest.strike} would be closer to at-the-money at the zone's midpoint (${zoneMid.toFixed(1)}) than today's recommended strike ${best.strike} — worth re-checking the chain for this strike if/when price actually reaches the zone, rather than assuming ${best.strike} is still the right one.`,
+        };
+      }
+
       recommendedEntry = {
         zoneLower,
         zoneUpper,
         referenceSpot: +zoneMid.toFixed(2),
         estimatedPremium: +atZone.price.toFixed(2),
         waitRequired,
+        betterStrikeForZone,
         note: waitRequired
           ? `Estimated value if price pulls back into the marked ${zoneLower}-${zoneUpper} zone, using today's IV — a theoretical projection, not a live quote or a guaranteed fill price.`
           : `Price is already at or through the marked ${zoneLower}-${zoneUpper} zone, so there's no pullback left to wait for — the current premium above is the real entry reference.`,
