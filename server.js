@@ -472,6 +472,30 @@ app.post("/trade-plan", async (req, res) => {
       })
       .filter(Boolean);
 
+    // Liquidity verdict: a single, unambiguous yes/no on whether this chain
+    // screenshot has ANYTHING worth trading, before we even get to picking a
+    // "best" strike. This is deliberately separate from recommendedStrike
+    // being null — that can also happen for reasons unrelated to liquidity
+    // (e.g. a bad target). Two distinct cases get two distinct messages:
+    // strikes existed but none cleared the liquidity bar (genuinely "not
+    // recommended" — don't trade this chain right now), vs. no strikes could
+    // even be read from the screenshot at all (a capture/extraction problem,
+    // not a liquidity verdict).
+    const strikesReadFromChain = (chain.strikes || []).length;
+    const liquidityVerdict = ranked.length > 0
+      ? {
+          status: "recommended",
+          label: "RECOMMENDED",
+          message: `${ranked.length} strike(s) on this ${chain.symbol || "chain"} meet the minimum liquidity bar (volume ≥ ${liquidityThreshold.minVolume}${dte > 0 ? `, open interest ≥ ${liquidityThreshold.minOpenInterest}` : ""}) — worth considering a trade from this list.`,
+        }
+      : {
+          status: "not_recommended",
+          label: "NOT RECOMMENDED",
+          message: strikesReadFromChain > 0
+            ? `None of the ${strikesReadFromChain} strike(s) read from this chain meet the minimum liquidity bar for ${chain.symbol || "this symbol"} (volume ≥ ${liquidityThreshold.minVolume}${dte > 0 ? `, open interest ≥ ${liquidityThreshold.minOpenInterest}` : ""}) — every one is too thin, misread, or missing ${direction} data to trade safely right now. Don't take a position off this chain; check a different expiry/strike range or re-capture the screenshot.`
+            : `No strikes could be read from the chain screenshot at all — re-check that the screenshot actually shows the options chain before trusting this result.`,
+        };
+
     // Rank: prefer real target-based return if we have a target; otherwise
     // prefer strikes closest to at-the-money (delta closest to 0.5 magnitude)
     // since that's the safer default for 0-3 DTE per our earlier discussion.
@@ -600,6 +624,7 @@ app.post("/trade-plan", async (req, res) => {
       daysToExpiration: dte,
       assumedDaysElapsedForTarget: target ? elapsedAssumed : null,
       entryZone: chart && chart.entryZoneLower != null ? { lower: chart.entryZoneLower, upper: chart.entryZoneUpper } : null,
+      liquidityVerdict,
       recommendedStrike: best,
       recommendedEntry,
       allStrikesRanked: ranked.sort((a, b) => a.strike - b.strike),
