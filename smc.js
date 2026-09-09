@@ -38,38 +38,49 @@ function determineTrend(swings) {
 
 // BOS = price closes beyond the most recent swing point IN the trend's own
 // direction (continuation). CHoCH = price closes beyond the most recent
-// swing point AGAINST the prior trend (a possible reversal). Only evaluated
-// against the very last bar, since we care about a FRESH break, not one that
-// happened many bars ago.
-function detectStructureBreaks(bars, swings, trend) {
-  const lastBar = bars[bars.length - 1];
+// swing point AGAINST the prior trend (a possible reversal).
+//
+// `lookback` widens the check to the last N bars instead of only the very
+// last one (default 1, the original behavior). Why this exists: if a
+// polling cycle runs a little late (a slow cold-start, a delayed check),
+// checking only bar N once bar N+1 has already closed would silently miss
+// a real break FOREVER — it only ever looked at whichever bar happened to
+// be "last" at the exact moment it checked. Widening the window means a
+// break that happened a bar or two ago and hasn't been un-broken is still
+// caught on the next check. Events are returned oldest-first; callers that
+// want "the most recent" should take the last entry.
+function detectStructureBreaks(bars, swings, trend, { lookback = 1 } = {}) {
   const lastSwingHigh = [...swings].reverse().find((s) => s.type === "high");
   const lastSwingLow = [...swings].reverse().find((s) => s.type === "low");
   const events = [];
+  const startIdx = Math.max(0, bars.length - lookback);
 
-  if (trend === "uptrend" && lastSwingHigh && lastBar.c > lastSwingHigh.price) {
-    events.push({
-      type: "BOS", direction: "bullish", brokenLevel: lastSwingHigh.price,
-      note: `Close ${lastBar.c} broke above swing high ${lastSwingHigh.price} — continuation of the uptrend.`,
-    });
-  }
-  if (trend === "uptrend" && lastSwingLow && lastBar.c < lastSwingLow.price) {
-    events.push({
-      type: "CHoCH", direction: "bearish", brokenLevel: lastSwingLow.price,
-      note: `Close ${lastBar.c} broke below swing low ${lastSwingLow.price} against the prior uptrend — possible reversal.`,
-    });
-  }
-  if (trend === "downtrend" && lastSwingLow && lastBar.c < lastSwingLow.price) {
-    events.push({
-      type: "BOS", direction: "bearish", brokenLevel: lastSwingLow.price,
-      note: `Close ${lastBar.c} broke below swing low ${lastSwingLow.price} — continuation of the downtrend.`,
-    });
-  }
-  if (trend === "downtrend" && lastSwingHigh && lastBar.c > lastSwingHigh.price) {
-    events.push({
-      type: "CHoCH", direction: "bullish", brokenLevel: lastSwingHigh.price,
-      note: `Close ${lastBar.c} broke above swing high ${lastSwingHigh.price} against the prior downtrend — possible reversal.`,
-    });
+  for (let i = startIdx; i < bars.length; i++) {
+    const bar = bars[i];
+    if (trend === "uptrend" && lastSwingHigh && bar.c > lastSwingHigh.price) {
+      events.push({
+        type: "BOS", direction: "bullish", brokenLevel: lastSwingHigh.price, barIndex: i,
+        note: `Close ${bar.c} broke above swing high ${lastSwingHigh.price} — continuation of the uptrend.`,
+      });
+    }
+    if (trend === "uptrend" && lastSwingLow && bar.c < lastSwingLow.price) {
+      events.push({
+        type: "CHoCH", direction: "bearish", brokenLevel: lastSwingLow.price, barIndex: i,
+        note: `Close ${bar.c} broke below swing low ${lastSwingLow.price} against the prior uptrend — possible reversal.`,
+      });
+    }
+    if (trend === "downtrend" && lastSwingLow && bar.c < lastSwingLow.price) {
+      events.push({
+        type: "BOS", direction: "bearish", brokenLevel: lastSwingLow.price, barIndex: i,
+        note: `Close ${bar.c} broke below swing low ${lastSwingLow.price} — continuation of the downtrend.`,
+      });
+    }
+    if (trend === "downtrend" && lastSwingHigh && bar.c > lastSwingHigh.price) {
+      events.push({
+        type: "CHoCH", direction: "bullish", brokenLevel: lastSwingHigh.price, barIndex: i,
+        note: `Close ${bar.c} broke above swing high ${lastSwingHigh.price} against the prior downtrend — possible reversal.`,
+      });
+    }
   }
   return events;
 }
@@ -116,21 +127,25 @@ function nearestTarget(swings, direction, spot) {
 // beyond price as a target). Returns signal: null if nothing fresh happened
 // on the latest bar — most bars should produce no signal, which is correct
 // behavior, not a bug.
-function findLatestSignal(bars, { swingStrength = 2 } = {}) {
+function findLatestSignal(bars, { swingStrength = 2, lookback = 1 } = {}) {
   if (!bars || bars.length < swingStrength * 2 + 3) {
     return { signal: null, reason: "Not enough bars yet to detect swing structure." };
   }
   const swings = findSwings(bars, swingStrength);
   const trend = determineTrend(swings);
-  const structureEvents = detectStructureBreaks(bars, swings, trend);
+  const structureEvents = detectStructureBreaks(bars, swings, trend, { lookback });
   const fvgs = detectFVGs(bars);
   const lastBar = bars[bars.length - 1];
 
   if (!structureEvents.length) {
-    return { signal: null, trend, swings, structureEvents, fvgs, reason: "No fresh break of structure or change of character on the most recent bar." };
+    return { signal: null, trend, swings, structureEvents, fvgs, reason: `No fresh break of structure or change of character in the last ${lookback} bar(s).` };
   }
 
-  const event = structureEvents[0];
+  // Events are oldest-first; the MOST RECENT one (highest barIndex) is the
+  // one that should actually drive a fresh entry decision — with lookback
+  // > 1 there can be more than one event in the window, and grabbing [0]
+  // would wrongly pick the oldest instead of the newest.
+  const event = structureEvents[structureEvents.length - 1];
   const direction = event.direction === "bullish" ? "call" : "put";
 
   const matchingFvgs = fvgs.filter((f) => f.type === event.direction);
