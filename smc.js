@@ -97,6 +97,19 @@ function detectFVGs(bars) {
   return fvgs;
 }
 
+// Nearest swing point beyond a given price, in the trade's direction — the
+// NEAREST untouched structural level a "call" could run to (next swing high
+// above spot) or a "put" could fall to (next swing low below spot). Factored
+// out of findLatestSignal so an already-open position can get a FRESH target
+// recomputed from current swing structure at any time, not just on the one
+// bar a break of structure actually fired.
+function nearestTarget(swings, direction, spot) {
+  const candidates = swings
+    .filter((s) => (direction === "call" ? s.type === "high" && s.price > spot : s.type === "low" && s.price < spot))
+    .sort((a, b) => (direction === "call" ? a.price - b.price : b.price - a.price));
+  return candidates[0] || null;
+}
+
 // Top-level entry point: run every detector and, if the most recent bar just
 // produced a BOS/CHoCH, turn that into an actual tradeable signal (direction
 // + nearest matching unfilled FVG as the entry zone + nearest swing point
@@ -125,10 +138,7 @@ function findLatestSignal(bars, { swingStrength = 2 } = {}) {
     ? matchingFvgs.reduce((a, b) => (Math.abs(b.top - lastBar.c) < Math.abs(a.top - lastBar.c) ? b : a))
     : null;
 
-  const candidateTargets = swings
-    .filter((s) => (direction === "call" ? s.type === "high" && s.price > lastBar.c : s.type === "low" && s.price < lastBar.c))
-    .sort((a, b) => (direction === "call" ? a.price - b.price : b.price - a.price));
-  const target = candidateTargets[0] || null;
+  const target = nearestTarget(swings, direction, lastBar.c);
 
   return {
     signal: { direction, event, spot: lastBar.c, entryZone, target: target ? target.price : null },
@@ -137,4 +147,4 @@ function findLatestSignal(bars, { swingStrength = 2 } = {}) {
   };
 }
 
-module.exports = { findSwings, determineTrend, detectStructureBreaks, detectFVGs, findLatestSignal };
+module.exports = { findSwings, determineTrend, detectStructureBreaks, detectFVGs, nearestTarget, findLatestSignal };
