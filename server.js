@@ -177,6 +177,15 @@ app.post("/analyze", async (req, res) => {
 });
  
 app.get("/", (req, res) => res.send("TradingView chart agent backend is running."));
+
+// ---- Paper-trading track (Stage 1) ----------------------------------------
+// Entirely separate from the manual Sahm/TradingView tool above — nothing
+// here changes that flow. Requires two new files alongside server.js:
+// alpacaClient.js and smc.js (plus this one, paper-bot-routes.js). Also
+// requires ALPACA_KEY_ID and ALPACA_SECRET_KEY set as environment variables
+// on Render (same place ANTHROPIC_API_KEY is set) — never hardcode them
+// here. See /paper-bot/health and /paper-bot/test-signals once deployed.
+app.use("/paper-bot", require("./paper-bot-routes"));
  
 app.get("/debug/routes", (req, res) => {
   const routes = [];
