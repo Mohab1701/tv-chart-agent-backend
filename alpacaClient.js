@@ -60,13 +60,28 @@ async function getAccount() {
   return alpacaFetch(`${TRADING_BASE}/account`);
 }
 
+// Open positions across the whole paper account (stocks AND options mixed
+// together — filter by asset_class === "us_option" for this project's
+// purposes). Alpaca stores avg_entry_price/current_price/unrealized_pl on
+// these DURABLY server-side, so this project never needs its own database
+// for "what did I pay and what's it worth now" — Alpaca already remembers.
 async function getOpenPositions() {
   return alpacaFetch(`${TRADING_BASE}/positions`);
 }
 
-// Places a market order to open a position. `symbol` here is the OCC option
-// symbol (e.g. "NVDA260918C00500000") for an options order, or the plain
-// ticker for a stock order.
+// Order history — used to reconstruct CLOSED trades for the dashboard
+// (a filled "sell" order closing out a prior option position). status can
+// be "open" | "closed" | "all"; closed also includes cancelled/rejected, so
+// callers should filter for status === "filled" themselves.
+async function getOrders({ status = "closed", limit = 100, symbols } = {}) {
+  const params = new URLSearchParams({ status, limit: String(limit), direction: "desc" });
+  if (symbols) params.set("symbols", Array.isArray(symbols) ? symbols.join(",") : symbols);
+  return alpacaFetch(`${TRADING_BASE}/orders?${params.toString()}`);
+}
+
+// Places a market order to open (or close) a position. `symbol` here is the
+// OCC option symbol (e.g. "NVDA260918C00500000") for an options order, or
+// the plain ticker for a stock order.
 async function placeOrder({ symbol, qty = 1, side = "buy", type = "market", time_in_force = "day" }) {
   return alpacaFetch(`${TRADING_BASE}/orders`, {
     method: "POST",
@@ -79,6 +94,103 @@ async function closePosition(symbol) {
   return alpacaFetch(`${TRADING_BASE}/positions/${encodeURIComponent(symbol)}`, { method: "DELETE" });
 }
 
+// ---- Options contract discovery & selection --------------------------------
+// This lives on the TRADING api (not the data api) — Alpaca's "option
+// contracts" list is contract METADATA (strike, expiration, OCC symbol),
+// separate from the "options snapshots" endpoint above which is live
+// PRICING for a chain you already know the shape of. We use contracts to
+// find what's available, then snapshots to price the one we picked.
+async function listOptionContracts(underlyingSymbol, { expirationDateGte, expirationDateLte, type, status = "active", limit = 200 } = {}) {
+  const params = new URLSearchParams({ underlying_symbols: underlyingSymbol, status, limit: String(limit) });
+  if (expirationDateGte) params.set("expiration_date_gte", expirationDateGte);
+  if (expirationDateLte) params.set("expiration_date_lte", expirationDateLte);
+  if (type) params.set("type", type); // "call" | "put"
+  const data = await alpacaFetch(`${TRADING_BASE}/options/contracts?${params.toString()}`);
+  return data.option_contracts || [];
+}
+
+// Fresh quote for ONE already-known option symbol (used to mark an open
+// position and check it against TP/SL). Queried directly by symbol rather
+// than by underlying chain, since we already know exactly which contract we
+// hold.
+async function getOptionQuote(optionSymbol) {
+  const url = `${DATA_BASE.replace("/v2", "/v1beta1")}/options/snapshots?symbols=${encodeURIComponent(optionSymbol)}`;
+  const data = await alpacaFetch(url);
+  const snap = (data.snapshots || data)[optionSymbol];
+  if (!snap) return null;
+  return {
+    ask: snap.latestQuote?.ap ?? null,
+    bid: snap.latestQuote?.bp ?? null,
+    impliedVolatility: snap.impliedVolatility ?? null,
+    greeks: snap.greeks || null,
+  };
+}
+
+// Date helper: "YYYY-MM-DD" N days from today (UTC), used to require an
+// expiration at least a day or two out — avoids the automated loop buying
+// something that expires worthless within one polling cycle.
+function isoDatePlusDays(days) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// Parses an OCC-format option symbol (e.g. "NVDA260918C00500000") into its
+// parts. The last 15 characters are always YYMMDD + C/P + 8-digit strike
+// (strike * 1000, zero-padded); everything before that is the root symbol.
+// Used as a fallback / cross-check since we also get these fields directly
+// from listOptionContracts, but positions/orders only ever hand back the
+// bare symbol string.
+function parseOccSymbol(occSymbol) {
+  const m = /^([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/.exec(occSymbol);
+  if (!m) return null;
+  const [, root, yy, mm, dd, cp, strikeRaw] = m;
+  return {
+    root,
+    expirationDate: `20${yy}-${mm}-${dd}`,
+    type: cp === "C" ? "call" : "put",
+    strike: parseInt(strikeRaw, 10) / 1000,
+  };
+}
+
+// Picks the nearest-expiration, closest-to-spot ("ATM") contract for a
+// direction ("call"|"put") and returns it WITH a live ask price attached.
+// Returns null (with a reason) if nothing tradable was found, rather than
+// throwing — callers should treat null as "skip this symbol this cycle".
+async function selectAtmContract(underlyingSymbol, spot, direction, { minDaysOut = 1 } = {}) {
+  const contracts = await listOptionContracts(underlyingSymbol, {
+    expirationDateGte: isoDatePlusDays(minDaysOut),
+    type: direction,
+  });
+  if (!contracts.length) return { contract: null, reason: `No tradable ${direction} contracts found for ${underlyingSymbol} at least ${minDaysOut} day(s) out.` };
+
+  const nearestExpiration = contracts.map((c) => c.expiration_date).sort()[0];
+  const sameExpiration = contracts.filter((c) => c.expiration_date === nearestExpiration);
+  const atm = sameExpiration.reduce((best, c) => {
+    const diff = Math.abs(parseFloat(c.strike_price) - spot);
+    return !best || diff < best.diff ? { c, diff } : best;
+  }, null).c;
+
+  const snapshotData = await getOptionsChain(underlyingSymbol, { expirationDate: nearestExpiration, optionType: direction });
+  const snap = (snapshotData.snapshots || snapshotData)[atm.symbol];
+  const ask = snap?.latestQuote?.ap ?? null;
+  if (!ask) return { contract: null, reason: `No live ask price available yet for ${atm.symbol} (thin/closed quote).` };
+
+  return {
+    contract: {
+      symbol: atm.symbol,
+      strike: parseFloat(atm.strike_price),
+      expirationDate: nearestExpiration,
+      type: direction,
+      ask,
+      bid: snap?.latestQuote?.bp ?? null,
+      impliedVolatility: snap?.impliedVolatility ?? null,
+      greeks: snap?.greeks || null,
+    },
+    reason: null,
+  };
+}
+
 module.exports = {
   TRADING_BASE,
   DATA_BASE,
@@ -87,6 +199,11 @@ module.exports = {
   getOptionsChain,
   getAccount,
   getOpenPositions,
+  getOrders,
   placeOrder,
   closePosition,
+  listOptionContracts,
+  getOptionQuote,
+  parseOccSymbol,
+  selectAtmContract,
 };
