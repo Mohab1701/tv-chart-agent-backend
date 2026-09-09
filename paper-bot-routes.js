@@ -1,15 +1,20 @@
 // Paper-trading track: entirely separate from the real Sahm/TradingView
-// manual tool. Mounted under /paper-bot/* in server.js. Nothing here is
-// wired to order placement yet (that's Stage 3) — right now this only
-// proves out the SMC signal-detection engine against REAL Alpaca market
-// data, and lets you check the Alpaca connection itself is working.
+// manual tool. Mounted under /paper-bot/* in server.js.
+//
+// Stage 1 (/health, /test-signals): proves out Alpaca connectivity and the
+// SMC signal-detection engine against real market data.
+// Stage 3+ (/run-cycle, /trades): actually places and closes REAL paper
+// orders via tradeEngine.js, and shows them in a simple browser page. See
+// tradeEngine.js for the full entry/exit rules ($3 fee each way, $300/
+// contract cap, 45%-loss stop, freshly-recomputed swing target as TP).
 const express = require("express");
-const { getBars, getAccount } = require("./alpacaClient");
+const { getBars, getAccount, getOpenPositions } = require("./alpacaClient");
 const { findLatestSignal } = require("./smc");
+const tradeEngine = require("./tradeEngine");
 
 const router = express.Router();
 
-const SYMBOLS = ["NVDA", "TSLA", "NFLX"];
+const SYMBOLS = tradeEngine.SYMBOLS;
 
 // GET /paper-bot/health — confirms ALPACA_KEY_ID/ALPACA_SECRET_KEY are set
 // and valid by fetching the paper account itself. Check this FIRST if
@@ -60,6 +65,116 @@ router.get("/test-signals", async (req, res) => {
     }
   }
   res.json({ generatedAt: new Date().toISOString(), results });
+});
+
+// GET /paper-bot/run-cycle — the actual automation trigger. Something
+// external has to hit this periodically (see the GitHub Actions workflow
+// added alongside this file) since Render's free tier can't run its own
+// background loop. Each call: for every symbol, either enters a new trade
+// (if a fresh signal fired and passes the filters) or checks an existing
+// one against its stop-loss/take-profit and closes it if crossed. This is
+// a REAL action endpoint — it can place and close real (paper) orders.
+router.get("/run-cycle", async (req, res) => {
+  try {
+    const result = await tradeEngine.runCycle();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function money(n) {
+  if (n == null || Number.isNaN(n)) return "—";
+  const sign = n < 0 ? "-" : "";
+  return `${sign}$${Math.abs(n).toFixed(2)}`;
+}
+function pnlSpan(n) {
+  if (n == null || Number.isNaN(n)) return `<span class="muted">—</span>`;
+  const cls = n > 0 ? "pos" : n < 0 ? "neg" : "muted";
+  const formatted = n > 0 ? `+${money(n)}` : money(n); // money() already prepends "-" for negatives
+  return `<span class="${cls}">${formatted}</span>`;
+}
+
+// GET /paper-bot/trades — the page you actually open in your browser. Shows
+// every OPEN paper position (with a live, freshly-recomputed target/stop)
+// plus your recent CLOSED trades, reconstructed straight from Alpaca's own
+// order history — nothing stored locally, so this survives redeploys.
+// Refreshes itself every 60s so you can just leave the tab open.
+router.get("/trades", async (req, res) => {
+  try {
+    const positions = (await getOpenPositions()).filter((p) => p.asset_class === "us_option");
+    const openRows = [];
+    for (const p of positions) {
+      const levels = await tradeEngine.computeLiveLevels(p);
+      if (levels.error) {
+        openRows.push({ symbol: p.symbol, direction: "?", entry: null, target: null, stop: null, status: "OPEN (quote unavailable)", pnl: null });
+        continue;
+      }
+      openRows.push({
+        symbol: levels.parsed.root,
+        direction: levels.parsed.type,
+        entry: levels.entryCostWithFee,
+        target: levels.targetLevel,
+        stop: levels.slLevel,
+        status: "OPEN",
+        pnl: levels.pnlIfSoldNow,
+      });
+    }
+    const closedTrades = await tradeEngine.getClosedTrades({ limit: 10 });
+    const closedRows = closedTrades.map((t) => ({
+      symbol: t.symbol,
+      direction: t.direction,
+      entry: t.entryCostWithFee,
+      target: null,
+      stop: null,
+      status: "CLOSED",
+      pnl: t.pnl,
+    }));
+
+    const rows = [...openRows, ...closedRows];
+    const rowsHtml = rows.length
+      ? rows.map((r) => `
+        <tr>
+          <td>${escapeHtml(r.symbol)}</td>
+          <td class="${r.direction === "call" ? "pos" : r.direction === "put" ? "neg" : "muted"}">${escapeHtml((r.direction || "?").toUpperCase())}</td>
+          <td>${money(r.entry)}</td>
+          <td>${r.target != null ? money(r.target) : '<span class="muted">n/a yet</span>'}</td>
+          <td>${r.stop != null ? money(r.stop) : '<span class="muted">—</span>'}</td>
+          <td><span class="badge ${r.status === "OPEN" ? "badge-open" : "badge-closed"}">${escapeHtml(r.status)}</span></td>
+          <td>${pnlSpan(r.pnl)}</td>
+        </tr>`).join("")
+      : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px;">No trades yet — nothing has fired since this went live.</td></tr>`;
+
+    res.set("Content-Type", "text/html").send(`<!doctype html>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
+<title>Paper-bot trades</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0f14; color:#e6e9ee; margin:0; padding:24px; }
+  h1 { font-size:18px; font-weight:600; margin:0 0 4px; }
+  p.sub { color:#8a94a3; margin:0 0 20px; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th { text-align:left; color:#8a94a3; font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; padding:8px 12px; border-bottom:1px solid #232b36; }
+  td { padding:10px 12px; border-bottom:1px solid #1a2028; }
+  tr:hover td { background:#111823; }
+  .pos { color:#3ddc84; } .neg { color:#ff6b6b; } .muted { color:#5a6472; }
+  .badge { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .badge-open { background:#1b3a2e; color:#3ddc84; }
+  .badge-closed { background:#232b36; color:#8a94a3; }
+</style></head>
+<body>
+  <h1>Paper-bot trades</h1>
+  <p class="sub">NVDA / TSLA / NFLX &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
+  <table>
+    <thead><tr><th>Symbol</th><th>Dir</th><th>Entry (incl. fee)</th><th>Target</th><th>Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>
+</body></html>`);
+  } catch (err) {
+    res.status(500).send(`<pre>Error loading trades: ${escapeHtml(err.message)}</pre>`);
+  }
 });
 
 module.exports = router;
