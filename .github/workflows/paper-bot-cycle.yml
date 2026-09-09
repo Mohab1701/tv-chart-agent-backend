@@ -1,0 +1,26 @@
+name: Paper-bot cycle
+
+# Render's free tier can't run its own background loop, so this is what
+# actually drives the automation: GitHub itself calls the bot's
+# /paper-bot/run-cycle endpoint on a schedule, and THAT single HTTP request
+# is what checks each symbol and enters/exits trades. Nothing runs unless
+# this workflow (or a manual click below) calls it.
+#
+# Schedule below is deliberately generous — every 15 minutes, 13:00-21:00
+# UTC, Mon-Fri — to safely cover US market hours (9:30am-4pm ET) across
+# both EDT and EST without needing to change the cron twice a year. Cycles
+# that land outside actual market hours just no-op (no bars / no signal),
+# so the extra runs are harmless.
+on:
+  schedule:
+    - cron: "*/15 13-21 * * 1-5"
+  workflow_dispatch: {} # lets you also trigger a cycle manually from the Actions tab, any time
+
+jobs:
+  run-cycle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit /paper-bot/run-cycle (retry once, in case Render is cold-starting)
+        run: |
+          URL="https://tv-chart-agent-backend.onrender.com/paper-bot/run-cycle"
+          curl -sS -f --max-time 90 "$URL" || curl -sS -f --max-time 90 "$URL"
