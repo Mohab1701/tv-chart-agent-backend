@@ -22,7 +22,10 @@ const alpacaClient = require("./alpacaClient");
 const { findSwings, findLatestSignal, nearestTarget } = require("./smc");
 const { blackScholes, impliedVolatility, initialLadder } = require("./blackScholes");
 
-const SYMBOLS = ["NVDA", "TSLA", "NFLX"];
+// Watchlist — mega-cap, heavily-traded, consistently liquid optionable
+// names. Expanded from the original NVDA/TSLA/NFLX at the user's request to
+// cover more opportunities without adding thinner/more speculative tickers.
+const SYMBOLS = ["NVDA", "TSLA", "NFLX", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD"];
 const ENTRY_FEE = 3;
 const EXIT_FEE = 3;
 const MAX_CONTRACT_COST = 300; // skip a signal if the contract itself costs more than this (ask * 100), before fees
