@@ -22,6 +22,25 @@ const alpacaClient = require("./alpacaClient");
 const { findSwings, findLatestSignal, nearestTarget } = require("./smc");
 const { blackScholes, impliedVolatility, initialLadder } = require("./blackScholes");
 
+// Push notifications via ntfy.sh (free, no account needed) — reads the
+// topic name from an env var, same discipline as the Alpaca keys: never
+// hardcode it into a committed file. If NTFY_TOPIC isn't set, notifications
+// are silently skipped (never blocks or breaks an actual trade action over
+// a notification failing).
+async function notify(title, message) {
+  const topic = process.env.NTFY_TOPIC;
+  if (!topic) return;
+  try {
+    await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
+      method: "POST",
+      headers: { Title: title, Priority: "high" },
+      body: message,
+    });
+  } catch (err) {
+    console.error("ntfy notification failed (trade action itself is unaffected):", err.message);
+  }
+}
+
 // Watchlist — mega-cap, heavily-traded, consistently liquid optionable
 // names. Expanded from the original NVDA/TSLA/NFLX at the user's request to
 // cover more opportunities without adding thinner/more speculative tickers.
@@ -31,6 +50,44 @@ const EXIT_FEE = 3;
 const MAX_CONTRACT_COST = 300; // skip a signal if the contract itself costs more than this (ask * 100), before fees
 const MIN_DAYS_OUT = 1; // never buy something expiring same-day — avoids a slow 15-min poll cycle missing a 0DTE exit
 const RISK_FREE_RATE = 0.05;
+const CONTRACTS_PER_TRADE = 1; // 1 contract per company, for now — each symbol tracked/closed independently, never stacked
+
+// The engine only runs when something external hits /run-cycle (GitHub
+// Actions, every 15 min during market hours). If one cycle runs late — a
+// slow cold-start, a delayed CI runner, GitHub Actions itself lagging — the
+// OLD behavior (checking only the single most-recent bar) could miss a real
+// breakout FOREVER: by the time the next cycle finally checked, that bar was
+// no longer "last" and the break was gone from view. Widening the check to
+// the last few bars means a break that already happened and hasn't been
+// un-broken is still caught on the next check, even if that check is late.
+// 3 bars of 15-min data = up to 45 minutes of slack — generous for a
+// scheduled job, not so wide that it starts reacting to stale-by-hours moves.
+const SIGNAL_LOOKBACK_BARS = 3;
+
+// Same principle as the manual tool's liquidity screener: a strike that's
+// technically "closest to spot" isn't worth trading if almost nobody else
+// is trading it — a thin contract means bad fills and unreliable prices,
+// live or paper. Reject a candidate contract below its threshold even if
+// it's otherwise the perfect ATM strike. Numbers reused directly from the
+// manual tool's existing convention for NVDA/TSLA/NFLX; the newly added
+// mega-caps (AAPL/MSFT/AMZN/META/GOOGL/AMD) get the same tier since they're
+// comparably liquid, heavily-traded names.
+const LIQUIDITY_THRESHOLDS = {
+  NVDA: { minVolume: 100, minOpenInterest: 500 },
+  TSLA: { minVolume: 100, minOpenInterest: 500 },
+  NFLX: { minVolume: 100, minOpenInterest: 500 },
+  AAPL: { minVolume: 100, minOpenInterest: 500 },
+  MSFT: { minVolume: 100, minOpenInterest: 500 },
+  AMZN: { minVolume: 100, minOpenInterest: 500 },
+  META: { minVolume: 100, minOpenInterest: 500 },
+  GOOGL: { minVolume: 100, minOpenInterest: 500 },
+  AMD: { minVolume: 100, minOpenInterest: 500 },
+  DEFAULT: { minVolume: 50, minOpenInterest: 200 },
+};
+function liquidityThresholdFor(symbol) {
+  const key = String(symbol || "").trim().toUpperCase();
+  return LIQUIDITY_THRESHOLDS[key] || LIQUIDITY_THRESHOLDS.DEFAULT;
+}
 
 function yearsUntil(expirationDateStr) {
   // Treat expiry as 4pm ET market close on that date. Using a fixed UTC
@@ -63,7 +120,7 @@ async function evaluateAndMaybeEnter(symbol) {
     return { action: "skip", reason: "No bars returned (market closed with no recent data, or feed issue)." };
   }
 
-  const analysis = findLatestSignal(bars);
+  const analysis = findLatestSignal(bars, { lookback: SIGNAL_LOOKBACK_BARS });
   if (!analysis.signal) {
     return { action: "no-signal", reason: analysis.reason, trend: analysis.trend };
   }
@@ -76,6 +133,16 @@ async function evaluateAndMaybeEnter(symbol) {
     return { action: "skip", reason: selectReason, signal: analysis.signal };
   }
 
+  const threshold = liquidityThresholdFor(symbol);
+  if (contract.volume < threshold.minVolume || contract.openInterest < threshold.minOpenInterest) {
+    return {
+      action: "skip",
+      reason: `${contract.symbol} is too thin to trade (volume ${contract.volume}, open interest ${contract.openInterest} — needs at least ${threshold.minVolume}/${threshold.minOpenInterest}), skipping even though the signal and strike look valid.`,
+      signal: analysis.signal,
+      contract,
+    };
+  }
+
   const contractCost = contract.ask * 100;
   if (contractCost > MAX_CONTRACT_COST) {
     return {
@@ -86,7 +153,13 @@ async function evaluateAndMaybeEnter(symbol) {
     };
   }
 
-  const order = await alpacaClient.placeOrder({ symbol: contract.symbol, qty: 1, side: "buy", type: "market", time_in_force: "day" });
+  const order = await alpacaClient.placeOrder({ symbol: contract.symbol, qty: CONTRACTS_PER_TRADE, side: "buy", type: "market", time_in_force: "day" });
+  const entryCostWithFee = +(contractCost + ENTRY_FEE).toFixed(2);
+
+  await notify(
+    `Entered ${symbol} ${direction.toUpperCase()}`,
+    `Bought ${CONTRACTS_PER_TRADE}x ${contract.symbol} @ $${contract.ask} — cost incl. $${ENTRY_FEE} fee: $${entryCostWithFee}.`
+  );
 
   return {
     action: "entered",
@@ -95,9 +168,9 @@ async function evaluateAndMaybeEnter(symbol) {
     contract,
     order,
     entryCostRaw: +contractCost.toFixed(2),
-    entryCostWithFee: +(contractCost + ENTRY_FEE).toFixed(2),
+    entryCostWithFee,
     signal: analysis.signal,
-    reason: `${analysis.reason} Bought 1x ${contract.symbol} @ $${contract.ask} (cost incl. $${ENTRY_FEE} fee: $${(contractCost + ENTRY_FEE).toFixed(2)}).`,
+    reason: `${analysis.reason} Bought ${CONTRACTS_PER_TRADE}x ${contract.symbol} @ $${contract.ask} (cost incl. $${ENTRY_FEE} fee: $${entryCostWithFee}).`,
   };
 }
 
@@ -106,6 +179,20 @@ async function evaluateAndMaybeEnter(symbol) {
 // line. No side effects — safe to call from the dashboard on every page
 // load without risking an accidental close. evaluateAndMaybeExit (below)
 // is the only place allowed to actually act on these numbers.
+// Given how much profit a trade has reached (its HIGHEST point, not just
+// right now), works out where the trailing stop should sit — the same
+// convention as the manual tool's ladder: below breakevenTriggerPct (40%)
+// of profit, the stop is just the initial 45%-loss line; once profit has
+// EVER reached that trigger, the stop ratchets up in trailStepPct (20%)
+// increments and never moves back down. Pure function, easy to reason
+// about and unit-test on its own.
+function trailingStopLevel(entryCostWithFee, peakNet, ladder) {
+  const peakGainPct = ((peakNet - entryCostWithFee) / entryCostWithFee) * 100;
+  if (peakGainPct < ladder.breakevenTriggerPct) return ladder.initialSLPremium;
+  const stepsPast = Math.floor((peakGainPct - ladder.breakevenTriggerPct) / ladder.trailStepPct);
+  return +(entryCostWithFee * (1 + (stepsPast * ladder.trailStepPct) / 100)).toFixed(2);
+}
+
 async function computeLiveLevels(position) {
   const parsed = alpacaClient.parseOccSymbol(position.symbol);
   if (!parsed) return { error: `Could not parse option symbol ${position.symbol}.` };
@@ -115,21 +202,48 @@ async function computeLiveLevels(position) {
 
   const avgEntryPerShare = parseFloat(position.avg_entry_price);
   const entryCostWithFee = avgEntryPerShare * 100 + ENTRY_FEE;
-  const ladder = initialLadder(entryCostWithFee); // 45%-loss stop, in total per-contract dollars
+  const ladder = initialLadder(entryCostWithFee);
   const netIfSoldNow = quote.bid * 100 - EXIT_FEE;
+  const T = yearsUntil(parsed.expirationDate);
 
-  const bars = await alpacaClient.getBars(parsed.root, { timeframe: "15Min", limit: 100 });
+  const bars = await alpacaClient.getBars(parsed.root, { timeframe: "15Min", limit: 300 });
+
+  // Reconstruct the HIGHEST paper value this contract has been worth since
+  // it was opened, by re-pricing it (via Black-Scholes, same IV) at every
+  // underlying bar since entry — no local database needed, this is derived
+  // fresh from Alpaca's own order history + market data every time. Falls
+  // back to "just use right now" if the entry order can't be found or bars
+  // don't reach back far enough, which only makes the stop slightly less
+  // protective than ideal, never more dangerous.
+  let peakNet = netIfSoldNow;
   let targetTotal = null, targetUnderlyingPrice = null;
   if (bars.length) {
     const spot = bars[bars.length - 1].c;
+    const iv = quote.impliedVolatility || impliedVolatility(quote.ask ?? quote.bid, spot, parsed.strike, T, RISK_FREE_RATE, parsed.type) || 0.5;
     const swings = findSwings(bars, 2);
     const target = nearestTarget(swings, parsed.type, spot);
     if (target) {
-      const T = yearsUntil(parsed.expirationDate);
-      const iv = quote.impliedVolatility || impliedVolatility(quote.ask ?? quote.bid, spot, parsed.strike, T, RISK_FREE_RATE, parsed.type) || 0.5;
       const projected = blackScholes(target.price, parsed.strike, T, RISK_FREE_RATE, iv, parsed.type);
       targetTotal = +(projected.price * 100 - EXIT_FEE).toFixed(2);
       targetUnderlyingPrice = target.price;
+    }
+
+    try {
+      const recentOrders = await alpacaClient.getOrders({ status: "closed", symbols: position.symbol, limit: 20 });
+      const entryOrder = (recentOrders || [])
+        .filter((o) => o.status === "filled" && o.side === "buy")
+        .sort((a, b) => new Date(b.filled_at) - new Date(a.filled_at))[0];
+      if (entryOrder) {
+        const entryTime = new Date(entryOrder.filled_at).getTime();
+        for (const b of bars) {
+          if (new Date(b.t).getTime() < entryTime) continue;
+          const barT = yearsUntil(parsed.expirationDate) + (Date.now() - new Date(b.t).getTime()) / (365 * 24 * 60 * 60 * 1000);
+          const valAtBar = blackScholes(b.c, parsed.strike, Math.max(barT, 0), RISK_FREE_RATE, iv, parsed.type).price * 100 - EXIT_FEE;
+          if (valAtBar > peakNet) peakNet = valAtBar;
+        }
+      }
+    } catch (err) {
+      console.error(`Could not reconstruct peak value for ${position.symbol} (falling back to current value only):`, err.message);
     }
   }
 
@@ -138,41 +252,45 @@ async function computeLiveLevels(position) {
     quote,
     entryCostWithFee: +entryCostWithFee.toFixed(2),
     netIfSoldNow: +netIfSoldNow.toFixed(2),
-    slLevel: ladder.initialSLPremium,
-    targetLevel: targetTotal,
+    peakNet: +peakNet.toFixed(2),
+    trailStop: trailingStopLevel(entryCostWithFee, peakNet, ladder),
+    targetLevel: targetTotal, // informational only — no longer a forced exit trigger
     targetUnderlyingPrice,
     pnlIfSoldNow: +(netIfSoldNow - entryCostWithFee).toFixed(2),
   };
 }
 
 // ---- EXIT -------------------------------------------------------------------
+// Exit is driven ENTIRELY by the trailing stop now — no fixed take-profit.
+// Below +40% peak profit, that stop is just the initial 45%-loss line;
+// above it, the stop ratchets up in 20% steps and never gives back more
+// than one step's worth of profit, letting a winner run instead of getting
+// cut off at an arbitrary fixed target. targetLevel is still shown on the
+// dashboard as a reference (where structure suggests price could go), but
+// it no longer triggers a close.
 async function evaluateAndMaybeExit(position) {
   const levels = await computeLiveLevels(position);
   if (levels.error) return { action: "hold", reason: levels.error };
 
-  const { parsed, netIfSoldNow, slLevel, targetLevel, targetUnderlyingPrice } = levels;
+  const { parsed, netIfSoldNow, trailStop, peakNet, targetLevel } = levels;
 
-  if (netIfSoldNow <= slLevel) {
+  if (netIfSoldNow <= trailStop) {
     const closeOrder = await alpacaClient.closePosition(position.symbol);
+    const exitReason = trailStop > levels.entryCostWithFee ? "trailing-stop (locked in profit)" : "stop-loss";
+    await notify(
+      `Closed: ${parsed.root}`,
+      `Closed ${position.symbol} — net proceeds $${netIfSoldNow} <= stop $${trailStop} (peak was $${peakNet}).`
+    );
     return {
-      action: "exited", exitReason: "stop-loss", symbol: parsed.root,
-      netProceeds: netIfSoldNow, slLevel, closeOrder,
-      reason: `Stop-loss hit: net proceeds $${netIfSoldNow} <= SL level $${slLevel}. Closed ${position.symbol}.`,
-    };
-  }
-
-  if (targetLevel != null && netIfSoldNow >= targetLevel) {
-    const closeOrder = await alpacaClient.closePosition(position.symbol);
-    return {
-      action: "exited", exitReason: "take-profit", symbol: parsed.root,
-      netProceeds: netIfSoldNow, targetLevel, closeOrder,
-      reason: `Take-profit hit: net proceeds $${netIfSoldNow} >= target $${targetLevel} (underlying target ${targetUnderlyingPrice}). Closed ${position.symbol}.`,
+      action: "exited", exitReason, symbol: parsed.root,
+      netProceeds: netIfSoldNow, trailStop, peakNet, closeOrder,
+      reason: `${exitReason} hit: net proceeds $${netIfSoldNow} <= stop $${trailStop} (peak reached $${peakNet}). Closed ${position.symbol}.`,
     };
   }
 
   return {
-    action: "hold", symbol: parsed.root, netIfSoldNow, slLevel, targetLevel,
-    reason: `Holding ${position.symbol}: net now $${netIfSoldNow}, SL $${slLevel}, target ${targetLevel != null ? "$" + targetLevel : "n/a yet"}.`,
+    action: "hold", symbol: parsed.root, netIfSoldNow, trailStop, peakNet, targetLevel,
+    reason: `Holding ${position.symbol}: net now $${netIfSoldNow}, trailing stop $${trailStop} (peak $${peakNet}), reference target ${targetLevel != null ? "$" + targetLevel : "n/a yet"}.`,
   };
 }
 
@@ -237,8 +355,13 @@ module.exports = {
   MAX_CONTRACT_COST,
   MIN_DAYS_OUT,
   RISK_FREE_RATE,
+  CONTRACTS_PER_TRADE,
+  SIGNAL_LOOKBACK_BARS,
+  liquidityThresholdFor,
   yearsUntil,
   positionBelongsTo,
+  trailingStopLevel,
+  notify,
   computeLiveLevels,
   evaluateAndMaybeEnter,
   evaluateAndMaybeExit,
