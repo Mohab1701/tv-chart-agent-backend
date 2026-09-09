@@ -11,6 +11,7 @@ const express = require("express");
 const { getBars, getAccount, getOpenPositions } = require("./alpacaClient");
 const { findLatestSignal } = require("./smc");
 const tradeEngine = require("./tradeEngine");
+const { runBacktest } = require("./backtest");
 
 const router = express.Router();
 
@@ -67,6 +68,19 @@ router.get("/test-signals", async (req, res) => {
   res.json({ generatedAt: new Date().toISOString(), results });
 });
 
+// GET /paper-bot/test-notify — sends a harmless test push notification via
+// ntfy.sh, so you can confirm your phone is subscribed correctly WITHOUT
+// waiting for a real trade to fire. Requires NTFY_TOPIC to be set on Render
+// (same place as the Alpaca keys); if it's missing this just says so rather
+// than silently doing nothing.
+router.get("/test-notify", async (req, res) => {
+  if (!process.env.NTFY_TOPIC) {
+    return res.status(400).json({ ok: false, error: "NTFY_TOPIC is not set in the environment yet." });
+  }
+  await tradeEngine.notify("Test notification", "If you see this on your phone, notifications are wired up correctly.");
+  res.json({ ok: true, note: "Test notification sent — check your phone." });
+});
+
 // GET /paper-bot/run-cycle — the actual automation trigger. Something
 // external has to hit this periodically (see the GitHub Actions workflow
 // added alongside this file) since Render's free tier can't run its own
@@ -77,6 +91,28 @@ router.get("/test-signals", async (req, res) => {
 router.get("/run-cycle", async (req, res) => {
   try {
     const result = await tradeEngine.runCycle();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /paper-bot/backtest — walk-forward simulation of the SAME signal/
+// entry/exit logic the live bot runs, against real historical bars, so you
+// can see an actual win/loss count and probability instead of just trusting
+// the strategy on faith. Real Alpaca network access needed (only reachable
+// once deployed). Options pricing is approximated since Alpaca doesn't keep
+// deep historical options-chain data — see backtest.js's top comment and
+// the `caveats` field in the response for exactly what's approximated and
+// why. Query params: ?daysBack=90 (default; how far back to pull bars) and
+// ?symbols=NVDA,TSLA (default: the full watchlist).
+router.get("/backtest", async (req, res) => {
+  try {
+    const daysBack = req.query.daysBack ? parseInt(req.query.daysBack, 10) : 90;
+    const symbols = req.query.symbols
+      ? req.query.symbols.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)
+      : tradeEngine.SYMBOLS;
+    const result = await runBacktest({ symbols, daysBack });
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -117,8 +153,8 @@ router.get("/trades", async (req, res) => {
         symbol: levels.parsed.root,
         direction: levels.parsed.type,
         entry: levels.entryCostWithFee,
-        target: levels.targetLevel,
-        stop: levels.slLevel,
+        target: levels.targetLevel, // informational reference only — no longer a forced exit
+        stop: levels.trailStop, // the real, ratcheting exit trigger
         status: "OPEN",
         pnl: levels.pnlIfSoldNow,
       });
@@ -168,7 +204,7 @@ router.get("/trades", async (req, res) => {
   <h1>Paper-bot trades</h1>
   <p class="sub">NVDA / TSLA / NFLX &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
   <table>
-    <thead><tr><th>Symbol</th><th>Dir</th><th>Entry (incl. fee)</th><th>Target</th><th>Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
+    <thead><tr><th>Symbol</th><th>Dir</th><th>Entry (incl. fee)</th><th>Ref. Target</th><th>Trailing Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
     <tbody>${rowsHtml}</tbody>
   </table>
 </body></html>`);
