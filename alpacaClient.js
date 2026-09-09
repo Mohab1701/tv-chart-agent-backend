@@ -32,8 +32,20 @@ async function alpacaFetch(url, opts = {}) {
 // Recent OHLCV bars for a stock symbol. feed=iex explicitly, since a basic/
 // unfunded paper account only has entitlement to the free IEX feed, not the
 // full-market SIP feed — asking for SIP without a subscription errors out.
-async function getBars(symbol, { timeframe = "15Min", limit = 200 } = {}) {
-  const url = `${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars?timeframe=${timeframe}&limit=${limit}&adjustment=raw&feed=iex`;
+//
+// IMPORTANT: always passes an explicit `start` several calendar days back.
+// Without it, right after the market opens there simply aren't enough bars
+// from TODAY alone to detect any swing structure yet (the detector needs a
+// handful of bars on both sides of a candidate peak) — which meant a real
+// breakout in the first ~1h45m of the trading day was invisible to the bot.
+// Reaching back into prior sessions means swing/trend context carries over
+// into the new day, so the bot can recognize an opening-bell move instead
+// of only ever picking things up mid-morning. This is safe to do — the
+// "fresh signal" check only ever looks at the MOST RECENT bar, so older
+// history only adds context, it can never itself trigger a stale signal.
+async function getBars(symbol, { timeframe = "15Min", limit = 200, daysBack = 12 } = {}) {
+  const start = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
+  const url = `${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars?timeframe=${timeframe}&limit=${limit}&start=${encodeURIComponent(start)}&adjustment=raw&feed=iex`;
   const data = await alpacaFetch(url);
   return (data.bars || []).map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v }));
 }
