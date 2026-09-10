@@ -67,15 +67,26 @@ function impliedVolatility(marketPrice, S, K, T, r, type, { lo = 0.001, hi = 5, 
   return (a + b) / 2;
 }
 
-// Position & Risk ladder: 45% initial SL — same convention as the manual
-// tool (initialSLPremium = entry * 0.55, i.e. stop once the contract has
-// lost 45% of its entry value). entryPremium is PER-CONTRACT dollars
-// (already includes the entry fee if you pass the fee-adjusted cost).
+// Position & Risk ladder. entryPremium is PER-CONTRACT dollars (already
+// includes the entry fee if you pass the fee-adjusted cost). Three tiers,
+// paper-bot-only (this is a separate ladder shape from the manual tool's
+// own initialLadder in server.js — do not merge the two):
+//   1. Below breakevenTriggerPct (25%) peak profit: stop is the fixed
+//      initialSLPremium (45% loss stop, same as always).
+//   2. From 25% up to profitTriggerPct (40%) peak profit: stop moves to
+//      breakeven (entry cost) and sits there — no partial credit for
+//      profit yet, just "don't let a real winner turn into a loss."
+//   3. At 40% peak profit and beyond: stop locks in lockAtProfitTriggerPct
+//      (10%) of real profit immediately, then ratchets up by another
+//      trailStepPct (10%) for every additional 10 points of peak profit
+//      (50% peak -> +20% locked, 60% peak -> +30% locked, and so on).
 function initialLadder(entryPremium) {
   return {
     initialSLPremium: +(entryPremium * 0.55).toFixed(2),
-    breakevenTriggerPct: 40,
-    trailStepPct: 20,
+    breakevenTriggerPct: 25,
+    profitTriggerPct: 40,
+    lockAtProfitTriggerPct: 10,
+    trailStepPct: 10,
   };
 }
 
