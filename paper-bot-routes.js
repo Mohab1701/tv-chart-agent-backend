@@ -191,6 +191,7 @@ router.get("/trades", async (req, res) => {
         strike: levels.parsed.strike,
         expiration: levels.parsed.expirationDate,
         entry: levels.entryCostWithFee,
+        current: levels.netIfSoldNow, // live per-contract value right now (what Entry is compared against for P/L)
         stop: levels.trailStop, // the real, ratcheting exit trigger
         status: "OPEN",
         pnl: levels.pnlIfSoldNow,
@@ -209,6 +210,7 @@ router.get("/trades", async (req, res) => {
         strike: parsed ? parsed.strike : null,
         expiration: parsed ? parsed.expirationDate : null,
         entry: t.entryCostWithFee,
+        current: null, // already closed — no "current" price to show
         stop: null,
         status: "CLOSED",
         pnl: t.pnl,
@@ -224,12 +226,13 @@ router.get("/trades", async (req, res) => {
           <td>${r.strike != null ? r.strike.toFixed(2) : '<span class="muted">—</span>'}</td>
           <td>${r.expiration ? escapeHtml(r.expiration) : '<span class="muted">—</span>'}</td>
           <td>${money(r.entry)}</td>
+          <td>${r.current != null ? money(r.current) : '<span class="muted">—</span>'}</td>
           <td>${pctSpan(r.entry, r.pnl)}</td>
           <td>${r.stop != null ? money(r.stop) : '<span class="muted">—</span>'}</td>
           <td><span class="badge ${r.status === "OPEN" ? "badge-open" : "badge-closed"}">${escapeHtml(r.status)}</span></td>
           <td>${pnlSpan(r.pnl)}</td>
         </tr>`).join("")
-      : `<tr><td colspan="9" class="muted" style="text-align:center;padding:24px;">No trades yet — nothing has fired since this went live.</td></tr>`;
+      : `<tr><td colspan="10" class="muted" style="text-align:center;padding:24px;">No trades yet — nothing has fired since this went live.</td></tr>`;
 
     res.set("Content-Type", "text/html").send(`<!doctype html>
 <html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
@@ -251,7 +254,7 @@ router.get("/trades", async (req, res) => {
   <h1>Paper-bot trades</h1>
   <p class="sub">${SYMBOLS.join(" / ")} &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
   <table>
-    <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>Trailing Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
+    <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>Current Price</th><th>P/L %</th><th>Trailing Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
     <tbody>${rowsHtml}</tbody>
   </table>
 </body></html>`);
