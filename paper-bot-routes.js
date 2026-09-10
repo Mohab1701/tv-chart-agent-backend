@@ -15,6 +15,19 @@ const { runBacktest } = require("./backtest");
 
 const router = express.Router();
 
+// Every route below is either a real action (run-cycle can place/close real
+// paper orders) or live/near-live data (account status, current signals,
+// open positions). None of it should EVER be served from a cache by
+// anything sitting between a caller and this server — a browser, a CDN, a
+// proxy, anything. Setting this explicitly on every response, rather than
+// trusting defaults, closes that off regardless of which layer might
+// otherwise be tempted to reuse an old response for a GET request.
+router.use((req, res, next) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.set("Pragma", "no-cache");
+  next();
+});
+
 const SYMBOLS = tradeEngine.SYMBOLS;
 
 // GET /paper-bot/health — confirms ALPACA_KEY_ID/ALPACA_SECRET_KEY are set
@@ -105,14 +118,21 @@ router.get("/run-cycle", async (req, res) => {
 // deep historical options-chain data — see backtest.js's top comment and
 // the `caveats` field in the response for exactly what's approximated and
 // why. Query params: ?daysBack=90 (default; how far back to pull bars) and
-// ?symbols=NVDA,TSLA (default: the full watchlist).
+// ?symbols=NVDA,TSLA (default: the full watchlist). ?takeProfitPct=75 runs
+// the A/B comparison mode: closes a trade the instant it reaches that fixed
+// % gain instead of letting the trailing stop keep riding — omit it (the
+// default) to test the live bot's actual behavior, pure trailing stop with
+// no cap.
 router.get("/backtest", async (req, res) => {
   try {
     const daysBack = req.query.daysBack ? parseInt(req.query.daysBack, 10) : 90;
     const symbols = req.query.symbols
       ? req.query.symbols.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)
       : tradeEngine.SYMBOLS;
-    const result = await runBacktest({ symbols, daysBack });
+    const takeProfitPct = req.query.takeProfitPct != null && req.query.takeProfitPct !== ""
+      ? parseFloat(req.query.takeProfitPct)
+      : null;
+    const result = await runBacktest({ symbols, daysBack, takeProfitPct });
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
