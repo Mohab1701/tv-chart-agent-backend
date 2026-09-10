@@ -74,8 +74,24 @@ async function getLatestTrade(symbol) {
 // Options chain snapshot for a symbol: strikes, bid/ask, volume, open
 // interest, greeks — Alpaca's real market data, no screenshot involved.
 // `expirationDate` in YYYY-MM-DD; omit to get the nearest available.
+//
+// CRITICAL: this is the PATH-based chain endpoint (the underlying symbol is
+// already in the URL, right below) — Alpaca's docs are explicit that
+// `underlying_symbols` is NOT a valid query param here (that belongs to a
+// different, symbol-less variant of this endpoint). Passing it anyway used
+// to make Alpaca reject the whole request with a 400 ("unexpected query
+// parameter(s): underlying_symbols") — which meant EVERY real attempt to
+// price and select a contract failed, for every symbol, every time a
+// signal fired. This was invisible in every automated test because they
+// all mock alpacaClient.selectAtmContract directly, never actually calling
+// this function for real — the same blind spot that let the getBars date-
+// range bug and the missing volume/openInterest fields both slip through
+// earlier. Confirmed live: a real GitHub Actions run-cycle log showed
+// exactly this 400 for every symbol that got a fresh signal (NVDA, MSFT,
+// META, AMD), which is the real reason the trades page has shown "no
+// trades yet" this whole time, regardless of any of the earlier fixes.
 async function getOptionsChain(underlyingSymbol, { expirationDate, optionType } = {}) {
-  const params = new URLSearchParams({ underlying_symbols: underlyingSymbol, limit: "200" });
+  const params = new URLSearchParams({ limit: "200" });
   if (expirationDate) params.set("expiration_date", expirationDate);
   if (optionType) params.set("type", optionType); // "call" | "put"
   const url = `${DATA_BASE.replace("/v2", "/v1beta1")}/options/snapshots/${encodeURIComponent(underlyingSymbol)}?${params.toString()}`;
