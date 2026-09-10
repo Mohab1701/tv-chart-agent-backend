@@ -222,7 +222,7 @@ router.get("/trades", async (req, res) => {
 </style></head>
 <body>
   <h1>Paper-bot trades</h1>
-  <p class="sub">NVDA / TSLA / NFLX &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
+  <p class="sub">${SYMBOLS.join(" / ")} &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
   <table>
     <thead><tr><th>Symbol</th><th>Dir</th><th>Entry (incl. fee)</th><th>Ref. Target</th><th>Trailing Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
     <tbody>${rowsHtml}</tbody>
