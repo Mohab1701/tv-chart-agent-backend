@@ -22,11 +22,10 @@ const alpacaClient = require("./alpacaClient");
 const { findSwings, findLatestSignal, nearestTarget } = require("./smc");
 const { blackScholes, impliedVolatility, initialLadder } = require("./blackScholes");
 
-// Push notifications via ntfy.sh (free, no account needed) — reads the
-// topic name from an env var, same discipline as the Alpaca keys: never
-// hardcode it into a committed file. If NTFY_TOPIC isn't set, notifications
-// are silently skipped (never blocks or breaks an actual trade action over
-// a notification failing).
+// Push notifications via ntfy.sh -- reads the topic name from an env var,
+// same discipline as the Alpaca keys: never hardcode it into a committed
+// file. If NTFY_TOPIC isn't set, notifications are silently skipped (never
+// blocks or breaks an actual trade action over a notification failing).
 //
 // IMPORTANT: fetch() does NOT throw on an HTTP error status (400, 429,
 // etc.) -- it only throws on a real network failure. The original version
@@ -37,13 +36,26 @@ const { blackScholes, impliedVolatility, initialLadder } = require("./blackSchol
 // successfully" even though nothing actually went out. Now the response
 // status/body is checked explicitly and returned/logged either way, so a
 // real failure is visible instead of assumed away.
+//
+// NTFY_ACCESS_TOKEN (optional): confirmed live on 2026-09-10 that ntfy.sh's
+// anonymous/unauthenticated publish quota (250 msgs/day) is tracked PER
+// VISITOR IP, not per app -- and Render's shared egress IPs mean that quota
+// can be silently exhausted by a completely unrelated Render customer's
+// traffic at any random time of day, with zero warning. Setting this env
+// var to a personal ntfy.sh access token (Account -> Access Tokens) ties
+// publishing to that account's own quota instead of the shared anonymous
+// one. If it's not set, falls back to the old anonymous behavior.
 async function notify(title, message) {
   const topic = process.env.NTFY_TOPIC;
   if (!topic) return { ok: false, reason: "NTFY_TOPIC is not set." };
   try {
+    const headers = { Title: title, Priority: "high" };
+    if (process.env.NTFY_ACCESS_TOKEN) {
+      headers["Authorization"] = `Bearer ${process.env.NTFY_ACCESS_TOKEN}`;
+    }
     const resp = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
       method: "POST",
-      headers: { Title: title, Priority: "high" },
+      headers,
       body: message,
     });
     const bodyText = await resp.text().catch(() => "");
