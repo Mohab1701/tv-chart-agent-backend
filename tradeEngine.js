@@ -180,17 +180,24 @@ async function evaluateAndMaybeEnter(symbol) {
 // load without risking an accidental close. evaluateAndMaybeExit (below)
 // is the only place allowed to actually act on these numbers.
 // Given how much profit a trade has reached (its HIGHEST point, not just
-// right now), works out where the trailing stop should sit — the same
-// convention as the manual tool's ladder: below breakevenTriggerPct (40%)
-// of profit, the stop is just the initial 45%-loss line; once profit has
-// EVER reached that trigger, the stop ratchets up in trailStepPct (20%)
-// increments and never moves back down. Pure function, easy to reason
-// about and unit-test on its own.
+// right now), works out where the trailing stop should sit. Three tiers
+// (see initialLadder in blackScholes.js for the full rationale) — this is
+// the paper-bot's OWN ladder, separate from the manual tool's:
+//   - below breakevenTriggerPct (25%) peak profit: the fixed 45%-loss line.
+//   - from 25% up to profitTriggerPct (40%) peak profit: breakeven (entry
+//     cost) — a real winner can no longer turn into a net loss, but no
+//     profit is locked in yet either.
+//   - at 40%+ peak profit: lockAtProfitTriggerPct (10%) of profit locks in
+//     immediately, then ratchets up another trailStepPct (10%) for every
+//     additional 10 points of peak profit — never moves back down.
+// Pure function, easy to reason about and unit-test on its own.
 function trailingStopLevel(entryCostWithFee, peakNet, ladder) {
   const peakGainPct = ((peakNet - entryCostWithFee) / entryCostWithFee) * 100;
   if (peakGainPct < ladder.breakevenTriggerPct) return ladder.initialSLPremium;
-  const stepsPast = Math.floor((peakGainPct - ladder.breakevenTriggerPct) / ladder.trailStepPct);
-  return +(entryCostWithFee * (1 + (stepsPast * ladder.trailStepPct) / 100)).toFixed(2);
+  if (peakGainPct < ladder.profitTriggerPct) return +entryCostWithFee.toFixed(2);
+  const stepsPast = Math.floor((peakGainPct - ladder.profitTriggerPct) / ladder.trailStepPct);
+  const lockedPct = ladder.lockAtProfitTriggerPct + stepsPast * ladder.trailStepPct;
+  return +(entryCostWithFee * (1 + lockedPct / 100)).toFixed(2);
 }
 
 async function computeLiveLevels(position) {
@@ -299,9 +306,23 @@ async function evaluateAndMaybeExit(position) {
 // storage needed. Pairs each filled BUY with the next filled SELL for the
 // same option symbol (safe because this engine only ever holds one position
 // per underlying at a time and always closes fully before re-entering).
-async function getClosedTrades({ limit = 10 } = {}) {
+//
+// `symbols` scopes this to just this engine's own underlyings. This matters
+// once more than one bot shares the same Alpaca paper account (this stock
+// engine AND the separate XSP engine both trade out of one account) — Alpaca's
+// order history has no concept of "which bot," so without a filter the stock
+// dashboard would start showing XSP trades mixed in, and vice versa, the
+// moment both have real closed trades. Defaults to this module's own
+// SYMBOLS so existing callers (the stock /trades route) keep working exactly
+// as before with no changes needed on their end.
+async function getClosedTrades({ limit = 10, symbols = SYMBOLS } = {}) {
   const orders = await alpacaClient.getOrders({ status: "closed", limit: 200 });
-  const filled = (orders || []).filter((o) => o.status === "filled" && o.asset_class === "us_option");
+  const allowedRoots = new Set(symbols.map((s) => String(s).trim().toUpperCase()));
+  const filled = (orders || []).filter((o) => {
+    if (o.status !== "filled" || o.asset_class !== "us_option") return false;
+    const parsed = alpacaClient.parseOccSymbol(o.symbol);
+    return parsed && allowedRoots.has(parsed.root);
+  });
   const bySymbol = {};
   for (const o of filled) {
     (bySymbol[o.symbol] = bySymbol[o.symbol] || []).push(o);
