@@ -188,6 +188,14 @@ async function selectAtmContract(underlyingSymbol, spot, direction, { minDaysOut
   const ask = snap?.latestQuote?.ap ?? null;
   if (!ask) return { contract: null, reason: `No live ask price available yet for ${atm.symbol} (thin/closed quote).` };
 
+  // Volume comes from the contract's own daily bar (today's trading so
+  // far); open interest comes from the CONTRACT metadata itself (Alpaca's
+  // options-contracts endpoint reports it directly, updated once daily) —
+  // two different sources, both surfaced here so the caller can apply its
+  // own liquidity threshold, same principle as the manual tool's screener.
+  const volume = snap?.dailyBar?.v ?? 0;
+  const openInterest = atm.open_interest != null ? parseInt(atm.open_interest, 10) || 0 : 0;
+
   return {
     contract: {
       symbol: atm.symbol,
@@ -198,6 +206,8 @@ async function selectAtmContract(underlyingSymbol, spot, direction, { minDaysOut
       bid: snap?.latestQuote?.bp ?? null,
       impliedVolatility: snap?.impliedVolatility ?? null,
       greeks: snap?.greeks || null,
+      volume,
+      openInterest,
     },
     reason: null,
   };
