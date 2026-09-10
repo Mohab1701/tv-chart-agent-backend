@@ -90,8 +90,15 @@ router.get("/test-notify", async (req, res) => {
   if (!process.env.NTFY_TOPIC) {
     return res.status(400).json({ ok: false, error: "NTFY_TOPIC is not set in the environment yet." });
   }
-  await tradeEngine.notify("Test notification", "If you see this on your phone, notifications are wired up correctly.");
-  res.json({ ok: true, note: "Test notification sent — check your phone." });
+  // Report ntfy.sh's ACTUAL response instead of assuming success -- see the
+  // comment on notify() in tradeEngine.js for why the old version could lie
+  // about this.
+  const result = await tradeEngine.notify("Test notification", "If you see this on your phone, notifications are wired up correctly.");
+  if (result.ok) {
+    res.json({ ok: true, ntfyStatus: result.status, note: "ntfy.sh accepted the message (status " + result.status + ") — check your phone." });
+  } else {
+    res.status(502).json({ ok: false, ntfyStatus: result.status, ntfyBody: result.body, error: result.error, note: "ntfy.sh did NOT accept the message — see ntfyStatus/ntfyBody/error above." });
+  }
 });
 
 // GET /paper-bot/run-cycle — the actual automation trigger. Something
