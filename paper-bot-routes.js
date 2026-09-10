@@ -221,7 +221,7 @@ router.get("/trades", async (req, res) => {
         <tr>
           <td>${escapeHtml(r.symbol)}</td>
           <td class="${r.direction === "call" ? "pos" : r.direction === "put" ? "neg" : "muted"}">${escapeHtml((r.direction || "?").toUpperCase())}</td>
-          <td>${r.strike != null ? money(r.strike) : '<span class="muted">—</span>'}</td>
+          <td>${r.strike != null ? r.strike.toFixed(2) : '<span class="muted">—</span>'}</td>
           <td>${r.expiration ? escapeHtml(r.expiration) : '<span class="muted">—</span>'}</td>
           <td>${money(r.entry)}</td>
           <td>${pctSpan(r.entry, r.pnl)}</td>
