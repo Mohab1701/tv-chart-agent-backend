@@ -33,21 +33,35 @@ async function alpacaFetch(url, opts = {}) {
 // unfunded paper account only has entitlement to the free IEX feed, not the
 // full-market SIP feed — asking for SIP without a subscription errors out.
 //
-// IMPORTANT: always passes an explicit `start` several calendar days back.
-// Without it, right after the market opens there simply aren't enough bars
-// from TODAY alone to detect any swing structure yet (the detector needs a
-// handful of bars on both sides of a candidate peak) — which meant a real
-// breakout in the first ~1h45m of the trading day was invisible to the bot.
-// Reaching back into prior sessions means swing/trend context carries over
-// into the new day, so the bot can recognize an opening-bell move instead
-// of only ever picking things up mid-morning. This is safe to do — the
-// "fresh signal" check only ever looks at the MOST RECENT bar, so older
-// history only adds context, it can never itself trigger a stale signal.
+// Passes an explicit `start` several calendar days back so swing/trend
+// context carries over into a new day (a real breakout in the first
+// ~1h45m of the trading day needs bars from before today to detect any
+// swing structure at all) — see the daysBack comment below.
+//
+// CRITICAL: `sort=desc` + reversing the result is NOT optional. Alpaca's
+// bars endpoint defaults to sort=asc (oldest-first) and `limit` caps the
+// page at that many bars counting FORWARD from `start` — it does NOT mean
+// "the most recent N bars." With the default daysBack=12 and a typical
+// limit=100, a 15-min timeframe has ~26 bars/trading day, so the window
+// [start, now] holds far more than 100 bars — meaning an ascending,
+// un-paginated request silently returns the OLDEST 100 bars in that
+// 12-day window and never reaches anywhere near "now" at all. This was a
+// real, live bug: every symbol's "latest bar" was landing about a week
+// stale, permanently, because the truncation point drifts forward in
+// lockstep with `start` but never catches up to the present. The old
+// comment here claimed "the fresh-signal check only ever looks at the
+// MOST RECENT bar, so older history only adds context" — true of the
+// signal-detection code, but it assumed this function was actually
+// handing back bars that reached up to the present moment, which it
+// wasn't. Asking for `sort=desc` gets the most recent `limit` bars within
+// the window instead (newest-first), and reversing them restores the
+// ascending order every caller (smc.js, tradeEngine.js, backtest.js) relies
+// on, with the true latest bar last.
 async function getBars(symbol, { timeframe = "15Min", limit = 200, daysBack = 12 } = {}) {
   const start = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
-  const url = `${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars?timeframe=${timeframe}&limit=${limit}&start=${encodeURIComponent(start)}&adjustment=raw&feed=iex`;
+  const url = `${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars?timeframe=${timeframe}&limit=${limit}&start=${encodeURIComponent(start)}&adjustment=raw&feed=iex&sort=desc`;
   const data = await alpacaFetch(url);
-  return (data.bars || []).map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v }));
+  return (data.bars || []).map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v })).reverse();
 }
 
 // Latest trade price for a symbol (used as "spot" for the options math).
