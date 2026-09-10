@@ -22,38 +22,46 @@ const alpacaClient = require("./alpacaClient");
 const { findSwings, findLatestSignal, nearestTarget } = require("./smc");
 const { blackScholes, impliedVolatility, initialLadder } = require("./blackScholes");
 
-// Push notifications via ntfy.sh -- reads the topic name from an env var,
-// same discipline as the Alpaca keys: never hardcode it into a committed
-// file. If NTFY_TOPIC isn't set, notifications are silently skipped (never
+// Push notifications -- reads the topic name from an env var, same
+// discipline as the Alpaca keys: never hardcode it into a committed file.
+// If NTFY_TOPIC isn't set, notifications are silently skipped (never
 // blocks or breaks an actual trade action over a notification failing).
 //
 // IMPORTANT: fetch() does NOT throw on an HTTP error status (400, 429,
 // etc.) -- it only throws on a real network failure. The original version
 // of this function just did `await fetch(...)` and assumed success if
-// nothing threw, which meant a real rejection from ntfy.sh (bad topic
-// format, rate limit, whatever) would be silently swallowed and every
-// caller -- including the /test-notify route -- would report "sent
-// successfully" even though nothing actually went out. Now the response
-// status/body is checked explicitly and returned/logged either way, so a
-// real failure is visible instead of assumed away.
+// nothing threw, which meant a real rejection would be silently swallowed
+// and every caller -- including the /test-notify route -- would report
+// "sent successfully" even though nothing actually went out. Now the
+// response status/body is checked explicitly and returned/logged either
+// way, so a real failure is visible instead of assumed away.
 //
-// NTFY_ACCESS_TOKEN (optional): confirmed live on 2026-09-10 that ntfy.sh's
-// anonymous/unauthenticated publish quota (250 msgs/day) is tracked PER
-// VISITOR IP, not per app -- and Render's shared egress IPs mean that quota
-// can be silently exhausted by a completely unrelated Render customer's
-// traffic at any random time of day, with zero warning. Setting this env
-// var to a personal ntfy.sh access token (Account -> Access Tokens) ties
-// publishing to that account's own quota instead of the shared anonymous
-// one. If it's not set, falls back to the old anonymous behavior.
+// NTFY_SERVER_URL: confirmed live on 2026-09-10 that ntfy.sh's public
+// server enforces a 250 msgs/day quota tracked PER VISITOR IP for
+// unauthenticated publishes -- and Render's shared egress IPs mean that
+// quota can be silently exhausted by a completely unrelated Render
+// customer's traffic at any random time of day, with zero warning. Even
+// authenticating with a personal ntfy.sh access token did not bypass this
+// (still got rejected with the same 429). The durable fix: self-host a
+// dedicated ntfy instance (see magrabi-ntfy on Render, image
+// binwiederhier/ntfy, configured with NTFY_UPSTREAM_BASE_URL=https://ntfy.sh
+// for instant iOS push relay) so no other Render tenant's traffic can ever
+// touch this quota again. This env var points at that server; defaults to
+// the public ntfy.sh if not set, for backward compatibility.
+//
+// NTFY_ACCESS_TOKEN (optional, legacy): only relevant if still publishing
+// to the public ntfy.sh server -- ignored (harmlessly) when NTFY_SERVER_URL
+// points at a self-hosted instance with no auth configured.
 async function notify(title, message) {
   const topic = process.env.NTFY_TOPIC;
   if (!topic) return { ok: false, reason: "NTFY_TOPIC is not set." };
+  const serverUrl = (process.env.NTFY_SERVER_URL || "https://ntfy.sh").replace(/\/+$/, "");
   try {
     const headers = { Title: title, Priority: "high" };
     if (process.env.NTFY_ACCESS_TOKEN) {
       headers["Authorization"] = `Bearer ${process.env.NTFY_ACCESS_TOKEN}`;
     }
-    const resp = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
+    const resp = await fetch(`${serverUrl}/${encodeURIComponent(topic)}`, {
       method: "POST",
       headers,
       body: message,
