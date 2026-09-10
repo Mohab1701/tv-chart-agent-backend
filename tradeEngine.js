@@ -27,17 +27,34 @@ const { blackScholes, impliedVolatility, initialLadder } = require("./blackSchol
 // hardcode it into a committed file. If NTFY_TOPIC isn't set, notifications
 // are silently skipped (never blocks or breaks an actual trade action over
 // a notification failing).
+//
+// IMPORTANT: fetch() does NOT throw on an HTTP error status (400, 429,
+// etc.) -- it only throws on a real network failure. The original version
+// of this function just did `await fetch(...)` and assumed success if
+// nothing threw, which meant a real rejection from ntfy.sh (bad topic
+// format, rate limit, whatever) would be silently swallowed and every
+// caller -- including the /test-notify route -- would report "sent
+// successfully" even though nothing actually went out. Now the response
+// status/body is checked explicitly and returned/logged either way, so a
+// real failure is visible instead of assumed away.
 async function notify(title, message) {
   const topic = process.env.NTFY_TOPIC;
-  if (!topic) return;
+  if (!topic) return { ok: false, reason: "NTFY_TOPIC is not set." };
   try {
-    await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
+    const resp = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
       method: "POST",
       headers: { Title: title, Priority: "high" },
       body: message,
     });
+    const bodyText = await resp.text().catch(() => "");
+    if (!resp.ok) {
+      console.error(`ntfy notification REJECTED (status ${resp.status}): ${bodyText}`);
+      return { ok: false, status: resp.status, body: bodyText };
+    }
+    return { ok: true, status: resp.status, body: bodyText };
   } catch (err) {
     console.error("ntfy notification failed (trade action itself is unaffected):", err.message);
+    return { ok: false, error: err.message };
   }
 }
 
