@@ -52,12 +52,20 @@ const { blackScholes, impliedVolatility, initialLadder } = require("./blackSchol
 // NTFY_ACCESS_TOKEN (optional, legacy): only relevant if still publishing
 // to the public ntfy.sh server -- ignored (harmlessly) when NTFY_SERVER_URL
 // points at a self-hosted instance with no auth configured.
+// Every notify() call in this file is about a trade entering or exiting,
+// so tapping the push notification should take you straight to the live
+// trades dashboard instead of just opening the ntfy app itself. ntfy
+// supports this via a "Click" header carrying a URL. Overridable via
+// TRADES_URL in case the deployed domain ever changes; defaults to the
+// known live URL otherwise.
+const TRADES_URL = process.env.TRADES_URL || "https://tv-chart-agent-backend.onrender.com/paper-bot/trades";
+
 async function notify(title, message) {
   const topic = process.env.NTFY_TOPIC;
   if (!topic) return { ok: false, reason: "NTFY_TOPIC is not set." };
   const serverUrl = (process.env.NTFY_SERVER_URL || "https://ntfy.sh").replace(/\/+$/, "");
   try {
-    const headers = { Title: title, Priority: "high" };
+    const headers = { Title: title, Priority: "high", Click: TRADES_URL };
     if (process.env.NTFY_ACCESS_TOKEN) {
       headers["Authorization"] = `Bearer ${process.env.NTFY_ACCESS_TOKEN}`;
     }
