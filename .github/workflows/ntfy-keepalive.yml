@@ -1,0 +1,29 @@
+name: ntfy keep-alive
+
+# The self-hosted ntfy server (magrabi-ntfy, a separate Render service from
+# the main bot) sits on Render's FREE tier, which spins the service down
+# after ~15 minutes with no incoming requests. That's fine for a simple
+# request/response API, but ntfy notifications depend on the PHONE holding
+# a live, persistent connection to this server -- if the server goes to
+# sleep, that live connection drops, and push notifications silently stop
+# arriving until something wakes it back up and the phone reconnects.
+#
+# Fix: ping it constantly, more often than the 15-minute spin-down window,
+# so it never actually goes to sleep in the first place. This mirrors the
+# same pattern paper-bot-cycle.yml already uses to keep the main service
+# warm -- just pointed at the ntfy server instead, and running all day
+# (not just market hours), since a trade notification or a manual test can
+# happen any time.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {} # lets you trigger a ping manually from the Actions tab, any time
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping magrabi-ntfy to keep it awake
+        run: |
+          URL="https://magrabi-ntfy.onrender.com/"
+          curl -sS --max-time 60 "$URL" || curl -sS --max-time 60 "$URL"
