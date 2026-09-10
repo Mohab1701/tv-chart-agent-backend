@@ -49,11 +49,26 @@ function determineTrend(swings) {
 // break that happened a bar or two ago and hasn't been un-broken is still
 // caught on the next check. Events are returned oldest-first; callers that
 // want "the most recent" should take the last entry.
+//
+// RANGING / INSUFFICIENT-DATA GAP (fixed): the original version of this
+// function only had branches for trend === "uptrend"/"downtrend" — a
+// decisive breakout that happened WHILE determineTrend was reading the
+// swing structure as "ranging" (choppy, no consistent higher/lower highs
+// and lows yet) or "insufficient-data" (fewer than 2 swing highs/lows found
+// so far) produced zero signal, no matter how sharp the actual move was.
+// This was a real missed-trade case: a symbol chops sideways for a while
+// (which is exactly when trend legitimately reads "ranging"), then breaks
+// out hard in one direction — the live bot saw nothing. The fix below adds
+// the same close-beyond-the-nearest-swing-point check for these two states,
+// labeled BOS either way since there's no established prior trend for a
+// "change of character" to be relative to — it's just "structure just broke
+// out of a range/undefined state."
 function detectStructureBreaks(bars, swings, trend, { lookback = 1 } = {}) {
   const lastSwingHigh = [...swings].reverse().find((s) => s.type === "high");
   const lastSwingLow = [...swings].reverse().find((s) => s.type === "low");
   const events = [];
   const startIdx = Math.max(0, bars.length - lookback);
+  const isRangingOrUnclear = trend === "ranging" || trend === "insufficient-data";
 
   for (let i = startIdx; i < bars.length; i++) {
     const bar = bars[i];
@@ -79,6 +94,18 @@ function detectStructureBreaks(bars, swings, trend, { lookback = 1 } = {}) {
       events.push({
         type: "CHoCH", direction: "bullish", brokenLevel: lastSwingHigh.price, barIndex: i,
         note: `Close ${bar.c} broke above swing high ${lastSwingHigh.price} against the prior downtrend — possible reversal.`,
+      });
+    }
+    if (isRangingOrUnclear && lastSwingHigh && bar.c > lastSwingHigh.price) {
+      events.push({
+        type: "BOS", direction: "bullish", brokenLevel: lastSwingHigh.price, barIndex: i,
+        note: `Close ${bar.c} broke above swing high ${lastSwingHigh.price} out of a ${trend} state — new bullish structure.`,
+      });
+    }
+    if (isRangingOrUnclear && lastSwingLow && bar.c < lastSwingLow.price) {
+      events.push({
+        type: "BOS", direction: "bearish", brokenLevel: lastSwingLow.price, barIndex: i,
+        note: `Close ${bar.c} broke below swing low ${lastSwingLow.price} out of a ${trend} state — new bearish structure.`,
       });
     }
   }
