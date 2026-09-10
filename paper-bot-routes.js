@@ -8,7 +8,7 @@
 // tradeEngine.js for the full entry/exit rules ($3 fee each way, $300/
 // contract cap, 45%-loss stop, freshly-recomputed swing target as TP).
 const express = require("express");
-const { getBars, getAccount, getOpenPositions } = require("./alpacaClient");
+const { getBars, getAccount, getOpenPositions, parseOccSymbol } = require("./alpacaClient");
 const { findLatestSignal } = require("./smc");
 const tradeEngine = require("./tradeEngine");
 const { runBacktest } = require("./backtest");
@@ -188,6 +188,8 @@ router.get("/trades", async (req, res) => {
       openRows.push({
         symbol: levels.parsed.root,
         direction: levels.parsed.type,
+        strike: levels.parsed.strike,
+        expiration: levels.parsed.expirationDate,
         entry: levels.entryCostWithFee,
         stop: levels.trailStop, // the real, ratcheting exit trigger
         status: "OPEN",
@@ -195,14 +197,23 @@ router.get("/trades", async (req, res) => {
       });
     }
     const closedTrades = await tradeEngine.getClosedTrades({ limit: 10 });
-    const closedRows = closedTrades.map((t) => ({
-      symbol: t.symbol,
-      direction: t.direction,
-      entry: t.entryCostWithFee,
-      stop: null,
-      status: "CLOSED",
-      pnl: t.pnl,
-    }));
+    const closedRows = closedTrades.map((t) => {
+      // getClosedTrades doesn't carry strike/expiration on the trade object
+      // itself, but it does hand back the raw OCC option symbol it was
+      // reconstructed from -- parsing that locally here is enough, no need
+      // to touch tradeEngine.js's return shape for a display-only addition.
+      const parsed = parseOccSymbol(t.optionSymbol);
+      return {
+        symbol: t.symbol,
+        direction: t.direction,
+        strike: parsed ? parsed.strike : null,
+        expiration: parsed ? parsed.expirationDate : null,
+        entry: t.entryCostWithFee,
+        stop: null,
+        status: "CLOSED",
+        pnl: t.pnl,
+      };
+    });
 
     const rows = [...openRows, ...closedRows];
     const rowsHtml = rows.length
@@ -210,13 +221,15 @@ router.get("/trades", async (req, res) => {
         <tr>
           <td>${escapeHtml(r.symbol)}</td>
           <td class="${r.direction === "call" ? "pos" : r.direction === "put" ? "neg" : "muted"}">${escapeHtml((r.direction || "?").toUpperCase())}</td>
+          <td>${r.strike != null ? money(r.strike) : '<span class="muted">—</span>'}</td>
+          <td>${r.expiration ? escapeHtml(r.expiration) : '<span class="muted">—</span>'}</td>
           <td>${money(r.entry)}</td>
           <td>${pctSpan(r.entry, r.pnl)}</td>
           <td>${r.stop != null ? money(r.stop) : '<span class="muted">—</span>'}</td>
           <td><span class="badge ${r.status === "OPEN" ? "badge-open" : "badge-closed"}">${escapeHtml(r.status)}</span></td>
           <td>${pnlSpan(r.pnl)}</td>
         </tr>`).join("")
-      : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px;">No trades yet — nothing has fired since this went live.</td></tr>`;
+      : `<tr><td colspan="9" class="muted" style="text-align:center;padding:24px;">No trades yet — nothing has fired since this went live.</td></tr>`;
 
     res.set("Content-Type", "text/html").send(`<!doctype html>
 <html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
@@ -238,7 +251,7 @@ router.get("/trades", async (req, res) => {
   <h1>Paper-bot trades</h1>
   <p class="sub">${SYMBOLS.join(" / ")} &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
   <table>
-    <thead><tr><th>Symbol</th><th>Dir</th><th>Entry (incl. fee)</th><th>P/L %</th><th>Trailing Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
+    <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>Trailing Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
     <tbody>${rowsHtml}</tbody>
   </table>
 </body></html>`);
