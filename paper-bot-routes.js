@@ -153,6 +153,22 @@ function pnlSpan(n) {
   const formatted = n > 0 ? `+${money(n)}` : money(n); // money() already prepends "-" for negatives
   return `<span class="${cls}">${formatted}</span>`;
 }
+// Replaces the old "Ref. Target" column -- that number was purely
+// informational (the next swing-structure level's projected option value)
+// and never actually drove an exit, which made it confusing to read next
+// to a live position (it could even sit below entry cost with nothing
+// wrong). Gain/loss % is directly useful instead: the trailing-stop ladder
+// itself is defined in percentage terms (40% profit trigger, 20% ratchet
+// steps, 45% initial stop), so this number lets you see at a glance how
+// close a position is to its next ratchet step or its stop, which the
+// dollar P&L alone doesn't convey.
+function pctSpan(entry, pnl) {
+  if (entry == null || pnl == null || !entry || Number.isNaN(entry) || Number.isNaN(pnl)) return `<span class="muted">—</span>`;
+  const pct = (pnl / entry) * 100;
+  const cls = pct > 0 ? "pos" : pct < 0 ? "neg" : "muted";
+  const formatted = `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%`;
+  return `<span class="${cls}">${formatted}</span>`;
+}
 
 // GET /paper-bot/trades — the page you actually open in your browser. Shows
 // every OPEN paper position (with a live, freshly-recomputed target/stop)
@@ -173,7 +189,6 @@ router.get("/trades", async (req, res) => {
         symbol: levels.parsed.root,
         direction: levels.parsed.type,
         entry: levels.entryCostWithFee,
-        target: levels.targetLevel, // informational reference only — no longer a forced exit
         stop: levels.trailStop, // the real, ratcheting exit trigger
         status: "OPEN",
         pnl: levels.pnlIfSoldNow,
@@ -184,7 +199,6 @@ router.get("/trades", async (req, res) => {
       symbol: t.symbol,
       direction: t.direction,
       entry: t.entryCostWithFee,
-      target: null,
       stop: null,
       status: "CLOSED",
       pnl: t.pnl,
@@ -197,7 +211,7 @@ router.get("/trades", async (req, res) => {
           <td>${escapeHtml(r.symbol)}</td>
           <td class="${r.direction === "call" ? "pos" : r.direction === "put" ? "neg" : "muted"}">${escapeHtml((r.direction || "?").toUpperCase())}</td>
           <td>${money(r.entry)}</td>
-          <td>${r.target != null ? money(r.target) : '<span class="muted">n/a yet</span>'}</td>
+          <td>${pctSpan(r.entry, r.pnl)}</td>
           <td>${r.stop != null ? money(r.stop) : '<span class="muted">—</span>'}</td>
           <td><span class="badge ${r.status === "OPEN" ? "badge-open" : "badge-closed"}">${escapeHtml(r.status)}</span></td>
           <td>${pnlSpan(r.pnl)}</td>
@@ -224,7 +238,7 @@ router.get("/trades", async (req, res) => {
   <h1>Paper-bot trades</h1>
   <p class="sub">${SYMBOLS.join(" / ")} &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
   <table>
-    <thead><tr><th>Symbol</th><th>Dir</th><th>Entry (incl. fee)</th><th>Ref. Target</th><th>Trailing Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
+    <thead><tr><th>Symbol</th><th>Dir</th><th>Entry (incl. fee)</th><th>P/L %</th><th>Trailing Stop</th><th>Status</th><th>P&amp;L</th></tr></thead>
     <tbody>${rowsHtml}</tbody>
   </table>
 </body></html>`);
