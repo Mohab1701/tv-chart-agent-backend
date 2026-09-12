@@ -422,9 +422,9 @@ async function getClosedTrades({ limit = 10, symbols = SYMBOLS } = {}) {
       }
     }
   }
-  // Sort newest-first and trim to `limit` BEFORE the (network-calling)
-  // reconstruction pass below -- no point replaying bar history for trades
-  // that won't even be shown.
+  // Sort newest-first and trim to `limit` before building the final trade
+  // objects below -- no point doing the extra work for trades that won't
+  // even be shown.
   pairs.sort((a, b) => new Date(b.sell.filled_at) - new Date(a.sell.filled_at));
   const trimmed = pairs.slice(0, limit);
 
