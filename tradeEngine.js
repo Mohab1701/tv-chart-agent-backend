@@ -346,6 +346,86 @@ async function evaluateAndMaybeExit(position) {
   };
 }
 
+// Replays the SAME peak-tracking/ladder logic computeLiveLevels() uses for
+// an open position, but over the historical window between an
+// ALREADY-CLOSED trade's entry and its real exit -- to find what the
+// trailing-stop ladder's own rule said the exit price should have been, the
+// FIRST moment it was crossed.
+//
+// Why this exists: the bot only checks/closes on a schedule (every 5 min as
+// of 2026-09 -- see paper-bot-cycle.yml). If the option's value crashes
+// past the stop between two checks, the real fill (from Alpaca) can land
+// meaningfully worse than the stop level that actually triggered the close
+// -- e.g. a 45%-loss stop at $55 gets an actual fill of $40 because the
+// price kept falling in the 5 minutes before the next check ran. This
+// function recovers that $55 -- the intended, rule-triggered exit -- so the
+// dashboard's Closed table can report what the STRATEGY did, not how much
+// worse check-cadence slippage made the real fill.
+//
+// Returns { exitProceedsWithFee, reconstructed } -- reconstructed:true means
+// the ladder replay found the actual trigger point and the returned number
+// IS that stop level (not the real fill). reconstructed:false means the
+// replay couldn't find a breach (thin/missing bar data, or a trade that
+// somehow didn't close via the stop) and the real fill was kept as-is
+// rather than guessed at.
+//
+// IMPORTANT: this ONLY changes what the /trades dashboard displays. The
+// actual Alpaca paper account, its order history, and its real fill price
+// are completely untouched -- this is a reporting-only adjustment.
+async function reconstructIntendedExit({ optionSymbol, entryCostWithFee, enteredAt, exitedAt, actualExitProceeds }) {
+  const parsed = alpacaClient.parseOccSymbol(optionSymbol);
+  if (!parsed) return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
+
+  const entryTime = new Date(enteredAt).getTime();
+  const exitTime = new Date(exitedAt).getTime();
+  if (!(entryTime < exitTime)) return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
+
+  let bars;
+  try {
+    bars = await alpacaClient.getBarsBetween(parsed.root, {
+      timeframe: "15Min",
+      start: new Date(entryTime).toISOString(),
+      end: new Date(exitTime).toISOString(),
+    });
+  } catch (err) {
+    console.error(`Could not fetch historical bars to reconstruct ${optionSymbol}'s intended exit (keeping real fill):`, err.message);
+    return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
+  }
+  if (!bars.length) return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
+
+  const ladder = initialLadder(entryCostWithFee);
+  // Same "yearsUntil(now) + (now - barTime)" idiom computeLiveLevels uses to
+  // get years-to-expiry AS OF an arbitrary past bar, without a separate
+  // from-an-arbitrary-timestamp helper.
+  const nowAnchor = yearsUntil(parsed.expirationDate);
+  const msPerYear = 365 * 24 * 60 * 60 * 1000;
+
+  // Back out an implied vol from what was actually paid at entry (minus the
+  // entry fee, to isolate the option premium itself) so this replay's
+  // Black-Scholes repricing is anchored to reality rather than an arbitrary
+  // guess -- same spirit as computeLiveLevels' own IV handling.
+  const entryPremium = (entryCostWithFee - ENTRY_FEE) / 100;
+  const spotAtEntry = bars[0].c;
+  const T0 = Math.max(nowAnchor + (Date.now() - entryTime) / msPerYear, 0.0001);
+  const iv = impliedVolatility(entryPremium, spotAtEntry, parsed.strike, T0, RISK_FREE_RATE, parsed.type) || 0.5;
+
+  let peakNet = entryCostWithFee;
+  for (const b of bars) {
+    const barTime = new Date(b.t).getTime();
+    if (barTime < entryTime) continue;
+    const barT = Math.max(nowAnchor + (Date.now() - barTime) / msPerYear, 0);
+    const netAtBar = +(blackScholes(b.c, parsed.strike, barT, RISK_FREE_RATE, iv, parsed.type).price * 100 - EXIT_FEE).toFixed(2);
+    if (netAtBar > peakNet) peakNet = netAtBar;
+    const stopAtBar = trailingStopLevel(entryCostWithFee, peakNet, ladder);
+    if (netAtBar <= stopAtBar) {
+      return { exitProceedsWithFee: stopAtBar, reconstructed: true };
+    }
+  }
+  // Replay never found a breach (coarse bar data most likely) -- don't
+  // invent a number, just keep the real fill.
+  return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
+}
+
 // ---- CLOSED TRADE HISTORY ---------------------------------------------------
 // Reconstructs round-trip trades from Alpaca's own order history — no local
 // storage needed. Pairs each filled BUY with the next filled SELL for the
@@ -372,31 +452,57 @@ async function getClosedTrades({ limit = 10, symbols = SYMBOLS } = {}) {
   for (const o of filled) {
     (bySymbol[o.symbol] = bySymbol[o.symbol] || []).push(o);
   }
-  const trades = [];
+  const pairs = [];
   for (const symbol of Object.keys(bySymbol)) {
     const ordersForSymbol = bySymbol[symbol].sort((a, b) => new Date(a.filled_at) - new Date(b.filled_at));
     for (let i = 0; i < ordersForSymbol.length - 1; i++) {
       if (ordersForSymbol[i].side === "buy" && ordersForSymbol[i + 1].side === "sell") {
-        const buy = ordersForSymbol[i], sell = ordersForSymbol[i + 1];
-        const parsed = alpacaClient.parseOccSymbol(symbol);
-        const entryCostWithFee = +(parseFloat(buy.filled_avg_price) * 100 + ENTRY_FEE).toFixed(2);
-        const exitProceedsWithFee = +(parseFloat(sell.filled_avg_price) * 100 - EXIT_FEE).toFixed(2);
-        trades.push({
-          symbol: parsed ? parsed.root : symbol,
-          optionSymbol: symbol,
-          direction: parsed ? parsed.type : null,
-          entryCostWithFee,
-          exitProceedsWithFee,
-          pnl: +(exitProceedsWithFee - entryCostWithFee).toFixed(2),
-          enteredAt: buy.filled_at,
-          exitedAt: sell.filled_at,
-        });
+        pairs.push({ symbol, buy: ordersForSymbol[i], sell: ordersForSymbol[i + 1] });
         i++; // consume the pair
       }
     }
   }
-  trades.sort((a, b) => new Date(b.exitedAt) - new Date(a.exitedAt));
-  return trades.slice(0, limit);
+  // Sort newest-first and trim to `limit` BEFORE the (network-calling)
+  // reconstruction pass below -- no point replaying bar history for trades
+  // that won't even be shown.
+  pairs.sort((a, b) => new Date(b.sell.filled_at) - new Date(a.sell.filled_at));
+  const trimmed = pairs.slice(0, limit);
+
+  const trades = [];
+  for (const { symbol, buy, sell } of trimmed) {
+    const parsed = alpacaClient.parseOccSymbol(symbol);
+    const entryCostWithFee = +(parseFloat(buy.filled_avg_price) * 100 + ENTRY_FEE).toFixed(2);
+    const actualExitProceeds = +(parseFloat(sell.filled_avg_price) * 100 - EXIT_FEE).toFixed(2);
+
+    // Report what the trailing-stop ladder's own rule said the exit should
+    // be, not the (possibly worse) real fill caused by check-cadence
+    // slippage -- see reconstructIntendedExit's comment above for why.
+    let exitProceedsWithFee = actualExitProceeds;
+    try {
+      const replay = await reconstructIntendedExit({
+        optionSymbol: symbol,
+        entryCostWithFee,
+        enteredAt: buy.filled_at,
+        exitedAt: sell.filled_at,
+        actualExitProceeds,
+      });
+      exitProceedsWithFee = replay.exitProceedsWithFee;
+    } catch (err) {
+      console.error(`Intended-exit replay failed for ${symbol} (showing real fill instead):`, err.message);
+    }
+
+    trades.push({
+      symbol: parsed ? parsed.root : symbol,
+      optionSymbol: symbol,
+      direction: parsed ? parsed.type : null,
+      entryCostWithFee,
+      exitProceedsWithFee,
+      pnl: +(exitProceedsWithFee - entryCostWithFee).toFixed(2),
+      enteredAt: buy.filled_at,
+      exitedAt: sell.filled_at,
+    });
+  }
+  return trades;
 }
 
 // ---- CYCLE ------------------------------------------------------------------
@@ -429,6 +535,7 @@ module.exports = {
   trailingStopLevel,
   notify,
   computeLiveLevels,
+  reconstructIntendedExit,
   evaluateAndMaybeEnter,
   evaluateAndMaybeExit,
   getClosedTrades,
