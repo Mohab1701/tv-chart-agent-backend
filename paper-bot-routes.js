@@ -224,9 +224,23 @@ router.get("/trades", async (req, res) => {
       };
     });
 
-    const rows = [...openRows, ...closedRows];
-    const rowsHtml = rows.length
-      ? rows.map((r) => `
+    // Trailing stop cell gets flagged when this position's live value has
+    // already crossed its stop -- i.e. the EXACT SAME condition tradeEngine's
+    // evaluateAndMaybeExit() uses to actually close it (netIfSoldNow <=
+    // trailStop). This never changes what happens; it only tells you a
+    // check-cycle early that the position is due to close at the next
+    // run-cycle, so it doesn't read as a display bug when the stop shows
+    // higher than the current price.
+    function stopCell(r) {
+      if (r.stop == null) return '<span class="muted">—</span>';
+      const breached = r.current != null && r.current <= r.stop;
+      return breached
+        ? `<span class="neg">${money(r.stop)} &#9888;</span>`
+        : money(r.stop);
+    }
+
+    const openRowsHtml = openRows.length
+      ? openRows.map((r) => `
         <tr>
           <td>${escapeHtml(r.symbol)}</td>
           <td class="${r.direction === "call" ? "pos" : r.direction === "put" ? "neg" : "muted"}">${escapeHtml((r.direction || "?").toUpperCase())}</td>
@@ -236,10 +250,22 @@ router.get("/trades", async (req, res) => {
           <td>${pctSpan(r.entry, r.pnl)}</td>
           <td>${r.current != null ? money(r.current) : '<span class="muted">—</span>'}</td>
           <td>${pnlSpan(r.pnl)}</td>
-          <td>${r.stop != null ? money(r.stop) : '<span class="muted">—</span>'}</td>
-          <td><span class="badge ${r.status === "OPEN" ? "badge-open" : "badge-closed"}">${escapeHtml(r.status)}</span></td>
+          <td>${stopCell(r)}</td>
         </tr>`).join("")
-      : `<tr><td colspan="10" class="muted" style="text-align:center;padding:24px;">No trades yet — nothing has fired since this went live.</td></tr>`;
+      : `<tr><td colspan="9" class="muted" style="text-align:center;padding:24px;">No open positions right now.</td></tr>`;
+
+    const closedRowsHtml = closedRows.length
+      ? closedRows.map((r) => `
+        <tr>
+          <td>${escapeHtml(r.symbol)}</td>
+          <td class="${r.direction === "call" ? "pos" : r.direction === "put" ? "neg" : "muted"}">${escapeHtml((r.direction || "?").toUpperCase())}</td>
+          <td>${r.strike != null ? r.strike.toFixed(2) : '<span class="muted">—</span>'}</td>
+          <td>${r.expiration ? escapeHtml(r.expiration) : '<span class="muted">—</span>'}</td>
+          <td>${money(r.entry)}</td>
+          <td>${pctSpan(r.entry, r.pnl)}</td>
+          <td>${pnlSpan(r.pnl)}</td>
+        </tr>`).join("")
+      : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px;">No closed trades yet.</td></tr>`;
 
     res.set("Content-Type", "text/html").send(`<!doctype html>
 <html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
@@ -247,22 +273,28 @@ router.get("/trades", async (req, res) => {
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0f14; color:#e6e9ee; margin:0; padding:24px; }
   h1 { font-size:18px; font-weight:600; margin:0 0 4px; }
+  h2 { font-size:14px; font-weight:600; margin:28px 0 8px; color:#e6e9ee; }
   p.sub { color:#8a94a3; margin:0 0 20px; font-size:13px; }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   th { text-align:left; color:#8a94a3; font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; padding:8px 12px; border-bottom:1px solid #232b36; }
   td { padding:10px 12px; border-bottom:1px solid #1a2028; }
   tr:hover td { background:#111823; }
   .pos { color:#3ddc84; } .neg { color:#ff6b6b; } .muted { color:#5a6472; }
-  .badge { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
-  .badge-open { background:#1b3a2e; color:#3ddc84; }
-  .badge-closed { background:#232b36; color:#8a94a3; }
 </style></head>
 <body>
   <h1>Paper-bot trades</h1>
   <p class="sub">${SYMBOLS.join(" / ")} &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
+
+  <h2>Open positions</h2>
   <table>
-    <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>Current Price</th><th>P&amp;L</th><th>Trailing Stop</th><th>Status</th></tr></thead>
-    <tbody>${rowsHtml}</tbody>
+    <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>Current Price</th><th>P&amp;L</th><th>Trailing Stop</th></tr></thead>
+    <tbody>${openRowsHtml}</tbody>
+  </table>
+
+  <h2>Closed trades</h2>
+  <table>
+    <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>P&amp;L</th></tr></thead>
+    <tbody>${closedRowsHtml}</tbody>
   </table>
 </body></html>`);
   } catch (err) {
