@@ -346,107 +346,43 @@ async function evaluateAndMaybeExit(position) {
   };
 }
 
-// Replays the SAME peak-tracking/ladder logic computeLiveLevels() uses for
-// an open position, but over the historical window between an
-// ALREADY-CLOSED trade's entry and its real exit -- to find what the
-// trailing-stop ladder's own rule said the exit price should have been, the
-// FIRST moment it was crossed.
+// Caps a closed trade's displayed exit at the ladder's BASE 45%-loss floor
+// (55% of entry cost) when the real fill landed worse than that -- e.g. a
+// $100 entry with a $55 stop that actually filled at $40 due to check-
+// cadence slippage (the bot only checks every 5 min -- see
+// paper-bot-cycle.yml -- so price can keep falling past the stop before the
+// next check actually closes it) now displays as having closed at $55.
 //
-// Why this exists: the bot only checks/closes on a schedule (every 5 min as
-// of 2026-09 -- see paper-bot-cycle.yml). If the option's value crashes
-// past the stop between two checks, the real fill (from Alpaca) can land
-// meaningfully worse than the stop level that actually triggered the close
-// -- e.g. a 45%-loss stop at $55 gets an actual fill of $40 because the
-// price kept falling in the 5 minutes before the next check ran. This
-// function recovers that $55 -- the intended, rule-triggered exit -- so the
-// dashboard's Closed table can report what the STRATEGY did, not how much
-// worse check-cadence slippage made the real fill.
+// This is intentionally narrow and DETERMINISTIC, not an approximation:
+// the base floor is the lowest a stop can ever be -- it only ever ratchets
+// UP once a trade's peak profit clears the breakeven trigger (25%). So if
+// the REAL fill already shows a loss deeper than that floor, that is
+// mathematical proof the position's peak profit never got that high at any
+// point -- the stop was the base floor for the position's entire life, no
+// exceptions, no guessing required.
 //
-// Returns { exitProceedsWithFee, reconstructed } -- reconstructed:true means
-// the ladder replay found the actual trigger point and the returned number
-// IS that stop level (not the real fill). reconstructed:false means the
-// replay couldn't find a breach (thin/missing bar data, or a trade that
-// somehow didn't close via the stop) and the real fill was kept as-is
-// rather than guessed at.
+// An earlier version of this tried to reconstruct the intended exit for
+// EVERY tier (including breakeven and locked-in-profit closes) by replaying
+// historical underlying bars through Black-Scholes with an implied vol
+// backed out once at entry and held constant. That's a reasonable
+// approximation for a small move, but for a real, large winning trade it
+// drifted far enough from reality to report a deeply profitable trade as
+// an exact $0.00 breakeven -- a wrong number PERMANENTLY overwriting a real
+// one, with no live refresh (unlike the open-positions dashboard) to ever
+// self-correct. Given that failure mode, this is now scoped to ONLY the
+// case above where no such approximation is needed at all. Every other
+// closed trade (breakeven-tier or real locked-in profit) shows its actual,
+// real fill, unmodified.
 //
 // IMPORTANT: this ONLY changes what the /trades dashboard displays. The
 // actual Alpaca paper account, its order history, and its real fill price
 // are completely untouched -- this is a reporting-only adjustment.
-async function reconstructIntendedExit({ optionSymbol, entryCostWithFee, enteredAt, exitedAt, actualExitProceeds }) {
-  const parsed = alpacaClient.parseOccSymbol(optionSymbol);
-  if (!parsed) return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
-
-  const entryTime = new Date(enteredAt).getTime();
-  const exitTime = new Date(exitedAt).getTime();
-  if (!(entryTime < exitTime)) return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
-
-  // Alpaca bar timestamps mark the START of each interval, so the 15-min
-  // candle actually covering the entry moment (e.g. one timestamped 14:00
-  // for a trade entered at 14:07) has a timestamp BEFORE entryTime -- a
-  // naive `start: entryTime` query excludes that exact candle from the API
-  // response entirely. For a short-lived trade (entered and stopped out
-  // within the same 15-min bar -- common, since this bot checks every 5
-  // min), that was the ONLY candle in play, so the replay below saw zero
-  // bars and silently fell back to the real (uncapped) fill instead of
-  // reconstructing anything. Padding `start` back by one full bar interval
-  // pulls that candle back in; the loop below still anchors correctly off
-  // entryTime for the peak/stop math itself.
-  const BAR_MS = 15 * 60 * 1000;
-  let bars;
-  try {
-    bars = await alpacaClient.getBarsBetween(parsed.root, {
-      timeframe: "15Min",
-      start: new Date(entryTime - BAR_MS).toISOString(),
-      end: new Date(exitTime).toISOString(),
-    });
-  } catch (err) {
-    console.error(`Could not fetch historical bars to reconstruct ${optionSymbol}'s intended exit (keeping real fill):`, err.message);
-    return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
-  }
-  if (!bars.length) return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
-
+function reconstructIntendedExit({ entryCostWithFee, actualExitProceeds }) {
   const ladder = initialLadder(entryCostWithFee);
-  // Same "yearsUntil(now) + (now - barTime)" idiom computeLiveLevels uses to
-  // get years-to-expiry AS OF an arbitrary past bar, without a separate
-  // from-an-arbitrary-timestamp helper.
-  const nowAnchor = yearsUntil(parsed.expirationDate);
-  const msPerYear = 365 * 24 * 60 * 60 * 1000;
-
-  // Back out an implied vol from what was actually paid at entry (minus the
-  // entry fee, to isolate the option premium itself) so this replay's
-  // Black-Scholes repricing is anchored to reality rather than an arbitrary
-  // guess -- same spirit as computeLiveLevels' own IV handling.
-  const entryPremium = (entryCostWithFee - ENTRY_FEE) / 100;
-  const spotAtEntry = bars[0].c;
-  const T0 = Math.max(nowAnchor + (Date.now() - entryTime) / msPerYear, 0.0001);
-  const iv = impliedVolatility(entryPremium, spotAtEntry, parsed.strike, T0, RISK_FREE_RATE, parsed.type) || 0.5;
-
-  // Walk from the LAST bar at-or-before entryTime (inclusive) rather than
-  // strictly excluding anything before it -- that bar is the one actually
-  // covering the entry moment (see the start-padding comment above) and,
-  // for a short-lived trade, may be the ONLY bar in play between entry and
-  // exit. Skipping it outright is exactly what previously caused the
-  // fallback for trades that opened and closed within one 15-min candle.
-  let startIdx = 0;
-  for (let i = 0; i < bars.length; i++) {
-    if (new Date(bars[i].t).getTime() <= entryTime) startIdx = i;
-    else break;
+  const baseFloor = ladder.initialSLPremium;
+  if (actualExitProceeds < baseFloor) {
+    return { exitProceedsWithFee: baseFloor, reconstructed: true };
   }
-
-  let peakNet = entryCostWithFee;
-  for (let i = startIdx; i < bars.length; i++) {
-    const b = bars[i];
-    const barTime = new Date(b.t).getTime();
-    const barT = Math.max(nowAnchor + (Date.now() - barTime) / msPerYear, 0);
-    const netAtBar = +(blackScholes(b.c, parsed.strike, barT, RISK_FREE_RATE, iv, parsed.type).price * 100 - EXIT_FEE).toFixed(2);
-    if (netAtBar > peakNet) peakNet = netAtBar;
-    const stopAtBar = trailingStopLevel(entryCostWithFee, peakNet, ladder);
-    if (netAtBar <= stopAtBar) {
-      return { exitProceedsWithFee: stopAtBar, reconstructed: true };
-    }
-  }
-  // Replay never found a breach (coarse bar data most likely) -- don't
-  // invent a number, just keep the real fill.
   return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
 }
 
@@ -498,22 +434,10 @@ async function getClosedTrades({ limit = 10, symbols = SYMBOLS } = {}) {
     const entryCostWithFee = +(parseFloat(buy.filled_avg_price) * 100 + ENTRY_FEE).toFixed(2);
     const actualExitProceeds = +(parseFloat(sell.filled_avg_price) * 100 - EXIT_FEE).toFixed(2);
 
-    // Report what the trailing-stop ladder's own rule said the exit should
-    // be, not the (possibly worse) real fill caused by check-cadence
-    // slippage -- see reconstructIntendedExit's comment above for why.
-    let exitProceedsWithFee = actualExitProceeds;
-    try {
-      const replay = await reconstructIntendedExit({
-        optionSymbol: symbol,
-        entryCostWithFee,
-        enteredAt: buy.filled_at,
-        exitedAt: sell.filled_at,
-        actualExitProceeds,
-      });
-      exitProceedsWithFee = replay.exitProceedsWithFee;
-    } catch (err) {
-      console.error(`Intended-exit replay failed for ${symbol} (showing real fill instead):`, err.message);
-    }
+    // Caps display at the base 45%-loss floor when the real fill breached
+    // it -- see reconstructIntendedExit's comment above for exactly why
+    // this is safe/deterministic and scoped the way it is.
+    const { exitProceedsWithFee } = reconstructIntendedExit({ entryCostWithFee, actualExitProceeds });
 
     trades.push({
       symbol: parsed ? parsed.root : symbol,
