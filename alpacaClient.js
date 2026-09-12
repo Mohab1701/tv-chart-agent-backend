@@ -64,22 +64,6 @@ async function getBars(symbol, { timeframe = "15Min", limit = 200, daysBack = 12
   return (data.bars || []).map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v })).reverse();
 }
 
-// Bars for a FIXED, already-known-in-the-past [start, end] window — unlike
-// getBars() above, which always reaches up to "now" and is tuned for live
-// monitoring (see its sort=desc/reverse comment). This exists for replaying
-// history for an ALREADY-CLOSED trade (see reconstructIntendedExit in
-// tradeEngine.js): the window is bounded on both ends and short (one trade's
-// lifetime), so the naive ascending sort + generous limit Alpaca defaults to
-// is safe here and never risks truncating before reaching `end` the way an
-// unbounded "since start" request could.
-async function getBarsBetween(symbol, { timeframe = "15Min", start, end, limit = 2000 } = {}) {
-  const params = new URLSearchParams({
-    timeframe, limit: String(limit), start, end, adjustment: "raw", feed: "iex", sort: "asc",
-  });
-  const url = `${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars?${params.toString()}`;
-  const data = await alpacaFetch(url);
-  return (data.bars || []).map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v }));
-}
 
 // Latest trade price for a symbol (used as "spot" for the options math).
 async function getLatestTrade(symbol) {
@@ -264,7 +248,6 @@ module.exports = {
   TRADING_BASE,
   DATA_BASE,
   getBars,
-  getBarsBetween,
   getLatestTrade,
   getOptionsChain,
   getAccount,
