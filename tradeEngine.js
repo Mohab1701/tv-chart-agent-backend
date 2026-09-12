@@ -380,11 +380,23 @@ async function reconstructIntendedExit({ optionSymbol, entryCostWithFee, entered
   const exitTime = new Date(exitedAt).getTime();
   if (!(entryTime < exitTime)) return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
 
+  // Alpaca bar timestamps mark the START of each interval, so the 15-min
+  // candle actually covering the entry moment (e.g. one timestamped 14:00
+  // for a trade entered at 14:07) has a timestamp BEFORE entryTime -- a
+  // naive `start: entryTime` query excludes that exact candle from the API
+  // response entirely. For a short-lived trade (entered and stopped out
+  // within the same 15-min bar -- common, since this bot checks every 5
+  // min), that was the ONLY candle in play, so the replay below saw zero
+  // bars and silently fell back to the real (uncapped) fill instead of
+  // reconstructing anything. Padding `start` back by one full bar interval
+  // pulls that candle back in; the loop below still anchors correctly off
+  // entryTime for the peak/stop math itself.
+  const BAR_MS = 15 * 60 * 1000;
   let bars;
   try {
     bars = await alpacaClient.getBarsBetween(parsed.root, {
       timeframe: "15Min",
-      start: new Date(entryTime).toISOString(),
+      start: new Date(entryTime - BAR_MS).toISOString(),
       end: new Date(exitTime).toISOString(),
     });
   } catch (err) {
@@ -409,10 +421,22 @@ async function reconstructIntendedExit({ optionSymbol, entryCostWithFee, entered
   const T0 = Math.max(nowAnchor + (Date.now() - entryTime) / msPerYear, 0.0001);
   const iv = impliedVolatility(entryPremium, spotAtEntry, parsed.strike, T0, RISK_FREE_RATE, parsed.type) || 0.5;
 
+  // Walk from the LAST bar at-or-before entryTime (inclusive) rather than
+  // strictly excluding anything before it -- that bar is the one actually
+  // covering the entry moment (see the start-padding comment above) and,
+  // for a short-lived trade, may be the ONLY bar in play between entry and
+  // exit. Skipping it outright is exactly what previously caused the
+  // fallback for trades that opened and closed within one 15-min candle.
+  let startIdx = 0;
+  for (let i = 0; i < bars.length; i++) {
+    if (new Date(bars[i].t).getTime() <= entryTime) startIdx = i;
+    else break;
+  }
+
   let peakNet = entryCostWithFee;
-  for (const b of bars) {
+  for (let i = startIdx; i < bars.length; i++) {
+    const b = bars[i];
     const barTime = new Date(b.t).getTime();
-    if (barTime < entryTime) continue;
     const barT = Math.max(nowAnchor + (Date.now() - barTime) / msPerYear, 0);
     const netAtBar = +(blackScholes(b.c, parsed.strike, barT, RISK_FREE_RATE, iv, parsed.type).price * 100 - EXIT_FEE).toFixed(2);
     if (netAtBar > peakNet) peakNet = netAtBar;
