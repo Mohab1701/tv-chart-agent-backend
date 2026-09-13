@@ -204,7 +204,32 @@ router.get("/trades", async (req, res) => {
         pnl: levels.pnlIfSoldNow,
       });
     }
-    const closedTrades = await tradeEngine.getClosedTrades({ limit: 10 });
+    // Fetch a much wider window than the table displays -- the Net Total
+    // stat (below) needs every closed trade in the current day/month to sum
+    // correctly, not just the 10 most recent rows shown in the table. This
+    // costs nothing extra: getClosedTrades' real ceiling is the 200-order
+    // fetch inside it (unchanged), so raising the `limit` here just stops
+    // trimming the pairs it already fetched -- no additional Alpaca calls.
+    const allClosedTrades = await tradeEngine.getClosedTrades({ limit: 500 });
+    const closedTrades = allClosedTrades.slice(0, 10); // table keeps showing the same recent history as before
+
+    // Net Total: sums CLOSED trades' P&L only (open positions can still
+    // move, so they're deliberately excluded -- this is a realized-P&L
+    // figure, not a live account-value one). Calendar boundaries are UTC,
+    // matching every other timestamp already shown on this page (the
+    // "generated" ISO stamp, trade dates).
+    const now = new Date();
+    function sameUtcDay(iso) {
+      const d = new Date(iso);
+      return d.getUTCFullYear() === now.getUTCFullYear() && d.getUTCMonth() === now.getUTCMonth() && d.getUTCDate() === now.getUTCDate();
+    }
+    function sameUtcMonth(iso) {
+      const d = new Date(iso);
+      return d.getUTCFullYear() === now.getUTCFullYear() && d.getUTCMonth() === now.getUTCMonth();
+    }
+    const netTotalDaily = +allClosedTrades.filter((t) => sameUtcDay(t.exitedAt)).reduce((sum, t) => sum + t.pnl, 0).toFixed(2);
+    const netTotalMonthly = +allClosedTrades.filter((t) => sameUtcMonth(t.exitedAt)).reduce((sum, t) => sum + t.pnl, 0).toFixed(2);
+
     const closedRows = closedTrades.map((t) => {
       // getClosedTrades doesn't carry strike/expiration on the trade object
       // itself, but it does hand back the raw OCC option symbol it was
@@ -280,6 +305,13 @@ router.get("/trades", async (req, res) => {
   td { padding:10px 12px; border-bottom:1px solid #1a2028; }
   tr:hover td { background:#111823; }
   .pos { color:#3ddc84; } .neg { color:#ff6b6b; } .muted { color:#5a6472; }
+  .net-total-row { display:flex; align-items:baseline; gap:10px; margin:28px 0 8px; }
+  .net-total-row h2 { margin:0; }
+  .net-total-value { font-size:20px; font-weight:600; }
+  .net-total-period {
+    background:#161c25; color:#e6e9ee; border:1px solid #232b36; border-radius:6px;
+    font-size:12px; padding:4px 8px; margin-left:auto;
+  }
 </style></head>
 <body>
   <h1>Paper-bot trades</h1>
@@ -291,11 +323,47 @@ router.get("/trades", async (req, res) => {
     <tbody>${openRowsHtml}</tbody>
   </table>
 
-  <h2>Closed trades</h2>
+  <div class="net-total-row">
+    <h2>Closed trades</h2>
+    <span class="net-total-value" id="netTotalDaily">Net Total (today): ${pnlSpan(netTotalDaily)}</span>
+    <span class="net-total-value" id="netTotalMonthly" style="display:none">Net Total (this month): ${pnlSpan(netTotalMonthly)}</span>
+    <select class="net-total-period" id="netTotalPeriod">
+      <option value="daily">Daily</option>
+      <option value="monthly">Monthly</option>
+    </select>
+  </div>
   <table>
     <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>P&amp;L</th></tr></thead>
     <tbody>${closedRowsHtml}</tbody>
   </table>
+
+  <script>
+    // Purely a display toggle between the two server-computed totals above
+    // -- no recalculation happens client-side, and nothing here affects the
+    // table (which always shows full recent history regardless of this
+    // selection). localStorage just remembers your last choice across the
+    // page's own 60s auto-refresh; if it's unavailable for any reason this
+    // silently no-ops and simply defaults to Daily every time instead of
+    // breaking the page.
+    (function () {
+      var select = document.getElementById("netTotalPeriod");
+      var daily = document.getElementById("netTotalDaily");
+      var monthly = document.getElementById("netTotalMonthly");
+      var STORAGE_KEY = "paperbot_netTotalPeriod";
+      function apply(period) {
+        daily.style.display = period === "monthly" ? "none" : "inline";
+        monthly.style.display = period === "monthly" ? "inline" : "none";
+        select.value = period;
+      }
+      var saved = "daily";
+      try { saved = localStorage.getItem(STORAGE_KEY) || "daily"; } catch (e) {}
+      apply(saved);
+      select.addEventListener("change", function () {
+        apply(select.value);
+        try { localStorage.setItem(STORAGE_KEY, select.value); } catch (e) {}
+      });
+    })();
+  </script>
 </body></html>`);
   } catch (err) {
     res.status(500).send(`<pre>Error loading trades: ${escapeHtml(err.message)}</pre>`);
