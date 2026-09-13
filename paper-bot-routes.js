@@ -305,12 +305,11 @@ router.get("/trades", async (req, res) => {
   td { padding:10px 12px; border-bottom:1px solid #1a2028; }
   tr:hover td { background:#111823; }
   .pos { color:#3ddc84; } .neg { color:#ff6b6b; } .muted { color:#5a6472; }
-  .net-total-row { display:flex; align-items:baseline; gap:10px; margin:28px 0 8px; }
-  .net-total-row h2 { margin:0; }
+  .net-total-footer { display:flex; justify-content:flex-end; align-items:baseline; gap:10px; margin-top:20px; }
   .net-total-value { font-size:20px; font-weight:600; }
   .net-total-period {
     background:#161c25; color:#e6e9ee; border:1px solid #232b36; border-radius:6px;
-    font-size:12px; padding:4px 8px; margin-left:auto;
+    font-size:12px; padding:4px 8px;
   }
 </style></head>
 <body>
@@ -323,8 +322,13 @@ router.get("/trades", async (req, res) => {
     <tbody>${openRowsHtml}</tbody>
   </table>
 
-  <div class="net-total-row">
-    <h2>Closed trades</h2>
+  <h2>Closed trades</h2>
+  <table>
+    <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>P&amp;L</th></tr></thead>
+    <tbody>${closedRowsHtml}</tbody>
+  </table>
+
+  <div class="net-total-footer">
     <span class="net-total-value" id="netTotalDaily">Net Total (today): ${pnlSpan(netTotalDaily)}</span>
     <span class="net-total-value" id="netTotalMonthly" style="display:none">Net Total (this month): ${pnlSpan(netTotalMonthly)}</span>
     <select class="net-total-period" id="netTotalPeriod">
@@ -332,10 +336,6 @@ router.get("/trades", async (req, res) => {
       <option value="monthly">Monthly</option>
     </select>
   </div>
-  <table>
-    <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>P&amp;L</th></tr></thead>
-    <tbody>${closedRowsHtml}</tbody>
-  </table>
 
   <script>
     // Purely a display toggle between the two server-computed totals above
