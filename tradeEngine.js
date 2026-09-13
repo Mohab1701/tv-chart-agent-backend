@@ -97,6 +97,23 @@ const MIN_DAYS_OUT = 1; // never buy something expiring same-day — avoids a sl
 const RISK_FREE_RATE = 0.05;
 const CONTRACTS_PER_TRADE = 1; // 1 contract per company, for now — each symbol tracked/closed independently, never stacked
 
+// SIMULATED wallet size -- NOT a real Alpaca balance check. The paper
+// account's actual buying power is whatever Alpaca's paper-trading default
+// is (plenty), so every order below would fill regardless of this number.
+// This exists purely so the BOT'S OWN entry decisions behave as if it were
+// already running on a real, small live account: before this existed, the
+// bot could have up to nine positions open at once (one per SYMBOL), each
+// up to MAX_CONTRACT_COST, with zero regard for total capital at risk --
+// fine on paper money, but not a real risk profile to have learned to
+// expect once real dollars are on the line. Every new entry now checks
+// this against capital already committed to OTHER open positions (see
+// evaluateAndMaybeEnter below) and skips if it would exceed it. With
+// MAX_CONTRACT_COST at $300, this means in practice the bot will mostly
+// hold ONE position at a time (two would need to total under $500
+// combined) -- that's intentional: it's what actually sizing for a $500
+// account looks like, not a bug.
+const SIMULATED_WALLET_SIZE = 500;
+
 // The engine only runs when something external hits /run-cycle (GitHub
 // Actions, every 15 min during market hours). If one cycle runs late — a
 // slow cold-start, a delayed CI runner, GitHub Actions itself lagging — the
@@ -150,6 +167,20 @@ function positionBelongsTo(position, underlying) {
   return parsed && parsed.root === underlying;
 }
 
+// Sums entryCostWithFee (premium + the same $ENTRY_FEE convention used
+// everywhere else in this file) across every currently-open option
+// position, regardless of symbol -- i.e. total capital already committed,
+// for checking against SIMULATED_WALLET_SIZE before opening another one.
+function totalCommittedCapital(openPositions) {
+  return (openPositions || [])
+    .filter((p) => p.asset_class === "us_option")
+    .reduce((sum, p) => {
+      const qty = parseFloat(p.qty) || 1;
+      const perContract = parseFloat(p.avg_entry_price) * 100 + ENTRY_FEE;
+      return sum + perContract * qty;
+    }, 0);
+}
+
 // ---- ENTRY -----------------------------------------------------------------
 async function evaluateAndMaybeEnter(symbol) {
   const openPositions = await alpacaClient.getOpenPositions();
@@ -198,8 +229,26 @@ async function evaluateAndMaybeEnter(symbol) {
     };
   }
 
-  const order = await alpacaClient.placeOrder({ symbol: contract.symbol, qty: CONTRACTS_PER_TRADE, side: "buy", type: "market", time_in_force: "day" });
   const entryCostWithFee = +(contractCost + ENTRY_FEE).toFixed(2);
+
+  // Simulated-wallet check (see SIMULATED_WALLET_SIZE's comment above) --
+  // reuses the SAME openPositions fetched at the top of this function, so
+  // this costs no extra Alpaca call. This is the bot's own self-imposed
+  // limit, separate from and in addition to the real Alpaca paper account's
+  // actual (much larger) buying power, which would happily fill this order
+  // regardless.
+  const committed = totalCommittedCapital(openPositions);
+  const projectedTotal = +(committed + entryCostWithFee).toFixed(2);
+  if (projectedTotal > SIMULATED_WALLET_SIZE) {
+    return {
+      action: "skip",
+      reason: `${contract.symbol} would cost $${entryCostWithFee} on top of $${committed.toFixed(2)} already committed to other open positions ($${projectedTotal} total) — over the simulated $${SIMULATED_WALLET_SIZE} wallet cap used to size-check this bot as if it were already trading a $${SIMULATED_WALLET_SIZE} live account. Skipping even though the signal looks valid.`,
+      signal: analysis.signal,
+      contract,
+    };
+  }
+
+  const order = await alpacaClient.placeOrder({ symbol: contract.symbol, qty: CONTRACTS_PER_TRADE, side: "buy", type: "market", time_in_force: "day" });
 
   await notify(
     `Entered ${symbol} ${direction.toUpperCase()}`,
@@ -477,9 +526,11 @@ module.exports = {
   RISK_FREE_RATE,
   CONTRACTS_PER_TRADE,
   SIGNAL_LOOKBACK_BARS,
+  SIMULATED_WALLET_SIZE,
   liquidityThresholdFor,
   yearsUntil,
   positionBelongsTo,
+  totalCommittedCapital,
   trailingStopLevel,
   notify,
   computeLiveLevels,
