@@ -21,6 +21,7 @@
 const alpacaClient = require("./alpacaClient");
 const { findSwings, findLatestSignal, nearestTarget } = require("./smc");
 const { blackScholes, impliedVolatility, initialLadder } = require("./blackScholes");
+const peakStore = require("./peakStore");
 
 // Push notifications -- reads the topic name from an env var, same
 // discipline as the Alpaca keys: never hardcode it into a committed file.
@@ -309,14 +310,10 @@ async function computeLiveLevels(position) {
 
   const bars = await alpacaClient.getBars(parsed.root, { timeframe: "15Min", limit: 300 });
 
-  // Reconstruct the HIGHEST paper value this contract has been worth since
-  // it was opened, by re-pricing it (via Black-Scholes, same IV) at every
-  // underlying bar since entry — no local database needed, this is derived
-  // fresh from Alpaca's own order history + market data every time. Falls
-  // back to "just use right now" if the entry order can't be found or bars
-  // don't reach back far enough, which only makes the stop slightly less
-  // protective than ideal, never more dangerous.
-  let peakNet = netIfSoldNow;
+  // This target level is a SEPARATE, purely informational reference number
+  // (shown on the dashboard as "where structure suggests price could go")
+  // -- it has nothing to do with the trailing-stop peak below, and still
+  // needs bars/IV for its own one-off Black-Scholes projection.
   let targetTotal = null, targetUnderlyingPrice = null;
   if (bars.length) {
     const spot = bars[bars.length - 1].c;
@@ -328,25 +325,18 @@ async function computeLiveLevels(position) {
       targetTotal = +(projected.price * 100 - EXIT_FEE).toFixed(2);
       targetUnderlyingPrice = target.price;
     }
-
-    try {
-      const recentOrders = await alpacaClient.getOrders({ status: "closed", symbols: position.symbol, limit: 20 });
-      const entryOrder = (recentOrders || [])
-        .filter((o) => o.status === "filled" && o.side === "buy")
-        .sort((a, b) => new Date(b.filled_at) - new Date(a.filled_at))[0];
-      if (entryOrder) {
-        const entryTime = new Date(entryOrder.filled_at).getTime();
-        for (const b of bars) {
-          if (new Date(b.t).getTime() < entryTime) continue;
-          const barT = yearsUntil(parsed.expirationDate) + (Date.now() - new Date(b.t).getTime()) / (365 * 24 * 60 * 60 * 1000);
-          const valAtBar = blackScholes(b.c, parsed.strike, Math.max(barT, 0), RISK_FREE_RATE, iv, parsed.type).price * 100 - EXIT_FEE;
-          if (valAtBar > peakNet) peakNet = valAtBar;
-        }
-      }
-    } catch (err) {
-      console.error(`Could not reconstruct peak value for ${position.symbol} (falling back to current value only):`, err.message);
-    }
   }
+
+  // The trailing-stop peak is now tracked from REAL observed values only --
+  // see peakStore.js for the full rationale. This replaced a Black-Scholes/
+  // IV backward reconstruction that could badly misstate the past (proven
+  // concretely: the exact same underlying price path produced peaks
+  // anywhere from $642 to $1,117 depending only on which IV was assumed).
+  // Every time this function runs (every ~5 min via the cycle), it already
+  // has a REAL, non-approximated live bid -- so instead of guessing
+  // backward, we just remember the highest real value ever actually seen
+  // for this exact contract and use that as the peak.
+  const peakNet = peakStore.recordAndGetPeak(position.symbol, netIfSoldNow);
 
   return {
     parsed,
@@ -377,6 +367,11 @@ async function evaluateAndMaybeExit(position) {
 
   if (netIfSoldNow <= trailStop) {
     const closeOrder = await alpacaClient.closePosition(position.symbol);
+    // Position is done -- drop its remembered peak so nothing stale lingers
+    // (see peakStore.clearPeak's comment for why this matters, however
+    // unlikely). pruneToSymbols (in runCycle) would eventually catch this
+    // too, but clearing it immediately is free and more precise.
+    peakStore.clearPeak(position.symbol);
     const exitReason = trailStop > levels.entryCostWithFee ? "trailing-stop (locked in profit)" : "stop-loss";
     await notify(
       `Closed: ${parsed.root}`,
@@ -505,6 +500,12 @@ async function getClosedTrades({ limit = 10, symbols = SYMBOLS } = {}) {
 // ---- CYCLE ------------------------------------------------------------------
 async function runCycle(symbols = SYMBOLS) {
   const openPositions = (await alpacaClient.getOpenPositions()).filter((p) => p.asset_class === "us_option");
+  // Keep peakStore.js's persisted file from growing forever -- drop any
+  // remembered peak for a contract that isn't actually open anymore. Most
+  // closes already clear their own entry immediately (see
+  // evaluateAndMaybeExit), so this is mainly a safety net for anything
+  // closed some other way (e.g. manually, or a crash mid-close).
+  peakStore.pruneToSymbols(openPositions.map((p) => p.symbol));
   const results = {};
   for (const symbol of symbols) {
     try {
