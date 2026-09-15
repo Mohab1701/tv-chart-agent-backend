@@ -204,31 +204,63 @@ router.get("/trades", async (req, res) => {
         pnl: levels.pnlIfSoldNow,
       });
     }
-    // Fetch a much wider window than the table displays -- the Net Total
-    // stat (below) needs every closed trade in the current day/month to sum
-    // correctly, not just the 10 most recent rows shown in the table. This
-    // costs nothing extra: getClosedTrades' real ceiling is the 200-order
-    // fetch inside it (unchanged), so raising the `limit` here just stops
-    // trimming the pairs it already fetched -- no additional Alpaca calls.
+    // Fetch a much wider window than the table used to display -- the table
+    // is now itself filtered down to whatever single day/month is selected
+    // (see below), and that filtered set could legitimately reach back
+    // further than the last 10 trades once you're picking an arbitrary past
+    // date. This costs nothing extra: getClosedTrades' real ceiling is the
+    // 200-order fetch inside it (unchanged), so raising the `limit` here
+    // just stops trimming the pairs it already fetched -- no additional
+    // Alpaca calls.
     const allClosedTrades = await tradeEngine.getClosedTrades({ limit: 500 });
-    const closedTrades = allClosedTrades.slice(0, 10); // table keeps showing the same recent history as before
 
-    // Net Total: sums CLOSED trades' P&L only (open positions can still
-    // move, so they're deliberately excluded -- this is a realized-P&L
-    // figure, not a live account-value one). Calendar boundaries are UTC,
-    // matching every other timestamp already shown on this page (the
-    // "generated" ISO stamp, trade dates).
+    // Which single day (Daily) or month (Monthly) to filter BOTH the Net
+    // Total figure AND the Closed trades table down to -- previously the
+    // dropdown only relabeled the Net Total number while the table always
+    // showed the same fixed recent history regardless of selection. Now the
+    // table and the total always describe the exact same slice of trades.
+    // Calendar boundaries are UTC throughout, matching every other
+    // timestamp already shown on this page (the "generated" ISO stamp,
+    // trade dates) -- ?date=YYYY-MM-DD / ?month=YYYY-MM let you look back
+    // at any past day/month, not just today/this month.
     const now = new Date();
-    function sameUtcDay(iso) {
-      const d = new Date(iso);
-      return d.getUTCFullYear() === now.getUTCFullYear() && d.getUTCMonth() === now.getUTCMonth() && d.getUTCDate() === now.getUTCDate();
-    }
-    function sameUtcMonth(iso) {
-      const d = new Date(iso);
-      return d.getUTCFullYear() === now.getUTCFullYear() && d.getUTCMonth() === now.getUTCMonth();
-    }
-    const netTotalDaily = +allClosedTrades.filter((t) => sameUtcDay(t.exitedAt)).reduce((sum, t) => sum + t.pnl, 0).toFixed(2);
-    const netTotalMonthly = +allClosedTrades.filter((t) => sameUtcMonth(t.exitedAt)).reduce((sum, t) => sum + t.pnl, 0).toFixed(2);
+    function utcDateStr(d) { return d.toISOString().slice(0, 10); } // YYYY-MM-DD
+    function utcMonthStr(d) { return d.toISOString().slice(0, 7); } // YYYY-MM
+    const todayStr = utcDateStr(now);
+    const thisMonthStr = utcMonthStr(now);
+
+    const periodParam = req.query.period === "monthly" ? "monthly" : "daily";
+    const dateGiven = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || "");
+    const monthGiven = /^\d{4}-\d{2}$/.test(req.query.month || "");
+    const selectedDate = dateGiven ? req.query.date : todayStr;
+    const selectedMonth = monthGiven ? req.query.month : thisMonthStr;
+
+    function isOnDate(iso, dateStr) { return utcDateStr(new Date(iso)) === dateStr; }
+    function isInMonth(iso, monthStr) { return utcMonthStr(new Date(iso)) === monthStr; }
+
+    const periodFilteredTrades = periodParam === "monthly"
+      ? allClosedTrades.filter((t) => isInMonth(t.exitedAt, selectedMonth))
+      : allClosedTrades.filter((t) => isOnDate(t.exitedAt, selectedDate));
+    const netTotalForPeriod = +periodFilteredTrades.reduce((sum, t) => sum + t.pnl, 0).toFixed(2);
+
+    // Refresh URL reuses only params the user actually set (not ones we
+    // defaulted), so a plain visit with no ?date/?month keeps tracking
+    // "today"/"this month" fresh on every 60s auto-refresh, while an
+    // explicitly picked past date/month stays pinned across refreshes.
+    const refreshParams = [];
+    if (req.query.period === "monthly" || req.query.period === "daily") refreshParams.push(`period=${periodParam}`);
+    if (periodParam === "daily" && dateGiven) refreshParams.push(`date=${selectedDate}`);
+    if (periodParam === "monthly" && monthGiven) refreshParams.push(`month=${selectedMonth}`);
+    const refreshUrl = "/paper-bot/trades" + (refreshParams.length ? "?" + refreshParams.join("&") : "");
+
+    const MAX_DISPLAYED_CLOSED = 200; // sane ceiling; a single day/month realistically never gets close to this
+    const closedTrades = periodFilteredTrades.slice(0, MAX_DISPLAYED_CLOSED);
+    const closedTruncatedNote = periodFilteredTrades.length > MAX_DISPLAYED_CLOSED
+      ? ` (showing ${MAX_DISPLAYED_CLOSED} of ${periodFilteredTrades.length})`
+      : "";
+    const closedEmptyMessage = periodParam === "monthly"
+      ? `No closed trades in ${selectedMonth}.`
+      : `No closed trades on ${selectedDate}.`;
 
     const closedRows = closedTrades.map((t) => {
       // getClosedTrades doesn't carry strike/expiration on the trade object
@@ -290,10 +322,10 @@ router.get("/trades", async (req, res) => {
           <td>${pctSpan(r.entry, r.pnl)}</td>
           <td>${pnlSpan(r.pnl)}</td>
         </tr>`).join("")
-      : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px;">No closed trades yet.</td></tr>`;
+      : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px;">${escapeHtml(closedEmptyMessage)}</td></tr>`;
 
     res.set("Content-Type", "text/html").send(`<!doctype html>
-<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60;url=${refreshUrl}">
 <title>Paper-bot trades</title>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0f14; color:#e6e9ee; margin:0; padding:24px; }
@@ -311,6 +343,8 @@ router.get("/trades", async (req, res) => {
     background:#161c25; color:#e6e9ee; border:1px solid #232b36; border-radius:6px;
     font-size:12px; padding:4px 8px;
   }
+  .net-total-reset { font-size:11px; font-weight:400; color:#5a6472; text-decoration:none; margin-left:10px; }
+  .net-total-reset:hover { color:#8a94a3; text-decoration:underline; }
 </style></head>
 <body>
   <h1>Paper-bot trades</h1>
@@ -322,46 +356,52 @@ router.get("/trades", async (req, res) => {
     <tbody>${openRowsHtml}</tbody>
   </table>
 
-  <h2>Closed trades</h2>
+  <h2>Closed trades &mdash; ${periodParam === "monthly" ? escapeHtml(selectedMonth) : escapeHtml(selectedDate)}${escapeHtml(closedTruncatedNote)}
+    <a class="net-total-reset" href="/paper-bot/trades?period=${periodParam}">reset to ${periodParam === "monthly" ? "this month" : "today"}</a>
+  </h2>
   <table>
     <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>P&amp;L</th></tr></thead>
     <tbody>${closedRowsHtml}</tbody>
   </table>
 
   <div class="net-total-footer">
-    <span class="net-total-value" id="netTotalDaily">Net Total (today): ${pnlSpan(netTotalDaily)}</span>
-    <span class="net-total-value" id="netTotalMonthly" style="display:none">Net Total (this month): ${pnlSpan(netTotalMonthly)}</span>
+    <span class="net-total-value">Net Total (${periodParam === "monthly" ? escapeHtml(selectedMonth) : escapeHtml(selectedDate)}): ${pnlSpan(netTotalForPeriod)}</span>
+    <input type="date" class="net-total-period" id="netTotalDate" value="${selectedDate}" max="${todayStr}" ${periodParam === "monthly" ? 'style="display:none"' : ""}>
+    <input type="month" class="net-total-period" id="netTotalMonth" value="${selectedMonth}" max="${thisMonthStr}" ${periodParam === "daily" ? 'style="display:none"' : ""}>
     <select class="net-total-period" id="netTotalPeriod">
-      <option value="daily">Daily</option>
-      <option value="monthly">Monthly</option>
+      <option value="daily" ${periodParam === "daily" ? "selected" : ""}>Daily</option>
+      <option value="monthly" ${periodParam === "monthly" ? "selected" : ""}>Monthly</option>
     </select>
   </div>
 
   <script>
-    // Purely a display toggle between the two server-computed totals above
-    // -- no recalculation happens client-side, and nothing here affects the
-    // table (which always shows full recent history regardless of this
-    // selection). localStorage just remembers your last choice across the
-    // page's own 60s auto-refresh; if it's unavailable for any reason this
-    // silently no-ops and simply defaults to Daily every time instead of
-    // breaking the page.
+    // Both the Net Total figure AND the Closed trades table above are now
+    // filtered server-side to the exact day/month selected here -- picking
+    // Daily/Monthly or a specific date/month navigates to a new URL (full
+    // page reload) rather than just re-labeling a client-side number, so
+    // the filter survives the page's own 60s auto-refresh and is shareable/
+    // bookmarkable as a plain link.
     (function () {
       var select = document.getElementById("netTotalPeriod");
-      var daily = document.getElementById("netTotalDaily");
-      var monthly = document.getElementById("netTotalMonthly");
-      var STORAGE_KEY = "paperbot_netTotalPeriod";
-      function apply(period) {
-        daily.style.display = period === "monthly" ? "none" : "inline";
-        monthly.style.display = period === "monthly" ? "inline" : "none";
-        select.value = period;
+      var dateInput = document.getElementById("netTotalDate");
+      var monthInput = document.getElementById("netTotalMonth");
+      function showFieldsFor(period) {
+        dateInput.style.display = period === "monthly" ? "none" : "inline-block";
+        monthInput.style.display = period === "monthly" ? "inline-block" : "none";
       }
-      var saved = "daily";
-      try { saved = localStorage.getItem(STORAGE_KEY) || "daily"; } catch (e) {}
-      apply(saved);
-      select.addEventListener("change", function () {
-        apply(select.value);
-        try { localStorage.setItem(STORAGE_KEY, select.value); } catch (e) {}
-      });
+      function navigate() {
+        var params = new URLSearchParams();
+        params.set("period", select.value);
+        if (select.value === "monthly") {
+          if (monthInput.value) params.set("month", monthInput.value);
+        } else if (dateInput.value) {
+          params.set("date", dateInput.value);
+        }
+        window.location.href = "/paper-bot/trades?" + params.toString();
+      }
+      select.addEventListener("change", function () { showFieldsFor(select.value); navigate(); });
+      dateInput.addEventListener("change", navigate);
+      monthInput.addEventListener("change", navigate);
     })();
   </script>
 </body></html>`);
