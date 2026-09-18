@@ -1,5 +1,18 @@
-name: paper-bot run-cycle
+name: paper-bot run-cycle (SMT/ICT test service)
 
+# Pings the SMT/ICT Version's OWN separate Render service
+# (tv-chart-agent-backend-smtict.onrender.com), not production. Render's free
+# tier can't run its own background loop, so something external has to hit
+# /paper-bot/run-cycle periodically during market hours for the stock bot to
+# actually evaluate signals and open/close paper trades -- without this, the
+# /paper-bot/trades dashboard just shows whatever state existed at the last
+# manual visit to that URL.
+#
+# IMPORTANT: this file previously pointed at the PRODUCTION URL by mistake
+# (a leftover from before this branch got its own separate Render service).
+# Do not repoint this back to production -- that workflow lives in main's
+# own copy of this same filename, entirely independent of this branch's
+# copy, and already covers production on its own.
 on:
   schedule:
     - cron: "*/5 13-21 * * 1-5"
@@ -11,5 +24,5 @@ jobs:
     steps:
       - name: Hit /paper-bot/run-cycle (retry once, in case Render is cold-starting)
         run: |
-          URL="https://tv-chart-agent-backend.onrender.com/paper-bot/run-cycle"
+          URL="https://tv-chart-agent-backend-smtict.onrender.com/paper-bot/run-cycle"
           curl -sS -f --max-time 90 "$URL" || curl -sS -f --max-time 90 "$URL"
