@@ -188,10 +188,13 @@ function pctSpan(entry, pnl) {
   return `<span class="${cls}">${formatted}</span>`;
 }
 
-// GET /xsp-bot/trades — same Open/Closed split and trailing-stop breach
-// flag as the stock bot's /paper-bot/trades (see paper-bot-routes.js),
-// scoped to XSP + SPX positions/orders (see xspTradeEngine.getClosedTrades
-// for why the scoping matters).
+// GET /xsp-bot/trades — same Open/Closed split, trailing-stop breach flag,
+// and (now) the same date-filtered "Net Total" / period-dropdown / reset-
+// to-today design as the stock bot's /paper-bot/trades (see
+// paper-bot-routes.js, which this block deliberately mirrors line-for-line
+// where the logic is identical — only the data source and the mount path
+// differ), scoped to XSP + SPX positions/orders (see
+// xspTradeEngine.getClosedTrades for why the scoping matters).
 router.get("/trades", async (req, res) => {
   try {
     const positions = (await getOpenPositions()).filter(
@@ -219,8 +222,56 @@ router.get("/trades", async (req, res) => {
       });
     }
 
-    const closedTrades = await xspEngine.getClosedTrades({ limit: 10 });
-    const closedRows = closedTrades.map((t) => {
+    // Same reasoning as the stock bot's /trades: fetch a wide window since
+    // the table is now filtered down to whichever single day/month is
+    // selected below, which can legitimately reach further back than the
+    // last 10 trades once an arbitrary past date is picked. getClosedTrades'
+    // real ceiling (the underlying 200-order Alpaca fetch) is unchanged, so
+    // this just stops trimming the pairs it already fetched.
+    const allClosedTrades = await xspEngine.getClosedTrades({ limit: 500 });
+
+    // Which single day (Daily) or month (Monthly) to filter BOTH the Net
+    // Total figure AND the Closed trades table down to — mirrors
+    // paper-bot-routes.js exactly, including the UTC calendar-boundary
+    // convention used everywhere else on these pages.
+    const now = new Date();
+    function utcDateStr(d) { return d.toISOString().slice(0, 10); } // YYYY-MM-DD
+    function utcMonthStr(d) { return d.toISOString().slice(0, 7); } // YYYY-MM
+    const todayStr = utcDateStr(now);
+    const thisMonthStr = utcMonthStr(now);
+
+    const periodParam = req.query.period === "monthly" ? "monthly" : "daily";
+    const dateGiven = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || "");
+    const monthGiven = /^\d{4}-\d{2}$/.test(req.query.month || "");
+    const selectedDate = dateGiven ? req.query.date : todayStr;
+    const selectedMonth = monthGiven ? req.query.month : thisMonthStr;
+
+    function isOnDate(iso, dateStr) { return utcDateStr(new Date(iso)) === dateStr; }
+    function isInMonth(iso, monthStr) { return utcMonthStr(new Date(iso)) === monthStr; }
+
+    const periodFilteredTrades = periodParam === "monthly"
+      ? allClosedTrades.filter((t) => isInMonth(t.exitedAt, selectedMonth))
+      : allClosedTrades.filter((t) => isOnDate(t.exitedAt, selectedDate));
+    const netTotalForPeriod = +periodFilteredTrades.reduce((sum, t) => sum + t.pnl, 0).toFixed(2);
+
+    // Refresh URL reuses only params the user actually set (not ones we
+    // defaulted), same as the stock bot's page.
+    const refreshParams = [];
+    if (req.query.period === "monthly" || req.query.period === "daily") refreshParams.push(`period=${periodParam}`);
+    if (periodParam === "daily" && dateGiven) refreshParams.push(`date=${selectedDate}`);
+    if (periodParam === "monthly" && monthGiven) refreshParams.push(`month=${selectedMonth}`);
+    const refreshUrl = "/xsp-bot/trades" + (refreshParams.length ? "?" + refreshParams.join("&") : "");
+
+    const MAX_DISPLAYED_CLOSED = 200; // sane ceiling; a single day/month realistically never gets close to this
+    const closedTradesFiltered = periodFilteredTrades.slice(0, MAX_DISPLAYED_CLOSED);
+    const closedTruncatedNote = periodFilteredTrades.length > MAX_DISPLAYED_CLOSED
+      ? ` (showing ${MAX_DISPLAYED_CLOSED} of ${periodFilteredTrades.length})`
+      : "";
+    const closedEmptyMessage = periodParam === "monthly"
+      ? `No closed trades in ${selectedMonth}.`
+      : `No closed trades on ${selectedDate}.`;
+
+    const closedRows = closedTradesFiltered.map((t) => {
       const parsed = parseOccSymbol(t.optionSymbol);
       return {
         symbol: t.symbol,
@@ -266,10 +317,10 @@ router.get("/trades", async (req, res) => {
           <td>${pctSpan(r.entry, r.pnl)}</td>
           <td>${pnlSpan(r.pnl)}</td>
         </tr>`).join("")
-      : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px;">No closed trades yet.</td></tr>`;
+      : `<tr><td colspan="7" class="muted" style="text-align:center;padding:24px;">${escapeHtml(closedEmptyMessage)}</td></tr>`;
 
     res.set("Content-Type", "text/html").send(`<!doctype html>
-<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60;url=${refreshUrl}">
 <title>Index-bot trades (XSP/SPX)</title>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0f14; color:#e6e9ee; margin:0; padding:24px; }
@@ -281,6 +332,14 @@ router.get("/trades", async (req, res) => {
   td { padding:10px 12px; border-bottom:1px solid #1a2028; }
   tr:hover td { background:#111823; }
   .pos { color:#3ddc84; } .neg { color:#ff6b6b; } .muted { color:#5a6472; }
+  .net-total-footer { display:flex; justify-content:flex-end; align-items:baseline; gap:10px; margin-top:20px; }
+  .net-total-value { font-size:20px; font-weight:600; }
+  .net-total-period {
+    background:#161c25; color:#e6e9ee; border:1px solid #232b36; border-radius:6px;
+    font-size:12px; padding:4px 8px;
+  }
+  .net-total-reset { font-size:11px; font-weight:400; color:#5a6472; text-decoration:none; margin-left:10px; }
+  .net-total-reset:hover { color:#8a94a3; text-decoration:underline; }
 </style></head>
 <body>
   <h1>Index-bot trades</h1>
@@ -292,11 +351,52 @@ router.get("/trades", async (req, res) => {
     <tbody>${openRowsHtml}</tbody>
   </table>
 
-  <h2>Closed trades</h2>
+  <h2>Closed trades &mdash; ${periodParam === "monthly" ? escapeHtml(selectedMonth) : escapeHtml(selectedDate)}${escapeHtml(closedTruncatedNote)}
+    <a class="net-total-reset" href="/xsp-bot/trades?period=${periodParam}">reset to ${periodParam === "monthly" ? "this month" : "today"}</a>
+  </h2>
   <table>
     <thead><tr><th>Symbol</th><th>Dir</th><th>Strike</th><th>Expiry</th><th>Entry (incl. fee)</th><th>P/L %</th><th>P&amp;L</th></tr></thead>
     <tbody>${closedRowsHtml}</tbody>
   </table>
+
+  <div class="net-total-footer">
+    <span class="net-total-value">Net Total (${periodParam === "monthly" ? escapeHtml(selectedMonth) : escapeHtml(selectedDate)}): ${pnlSpan(netTotalForPeriod)}</span>
+    <input type="date" class="net-total-period" id="netTotalDate" value="${selectedDate}" max="${todayStr}" ${periodParam === "monthly" ? 'style="display:none"' : ""}>
+    <input type="month" class="net-total-period" id="netTotalMonth" value="${selectedMonth}" max="${thisMonthStr}" ${periodParam === "daily" ? 'style="display:none"' : ""}>
+    <select class="net-total-period" id="netTotalPeriod">
+      <option value="daily" ${periodParam === "daily" ? "selected" : ""}>Daily</option>
+      <option value="monthly" ${periodParam === "monthly" ? "selected" : ""}>Monthly</option>
+    </select>
+  </div>
+
+  <script>
+    // Same behavior as the stock bot's /trades page: picking Daily/Monthly
+    // or a specific date/month navigates to a new URL (full page reload)
+    // rather than just re-labeling a client-side number, so the filter
+    // survives the page's own 60s auto-refresh and is shareable/bookmarkable.
+    (function () {
+      var select = document.getElementById("netTotalPeriod");
+      var dateInput = document.getElementById("netTotalDate");
+      var monthInput = document.getElementById("netTotalMonth");
+      function showFieldsFor(period) {
+        dateInput.style.display = period === "monthly" ? "none" : "inline-block";
+        monthInput.style.display = period === "monthly" ? "inline-block" : "none";
+      }
+      function navigate() {
+        var params = new URLSearchParams();
+        params.set("period", select.value);
+        if (select.value === "monthly") {
+          if (monthInput.value) params.set("month", monthInput.value);
+        } else if (dateInput.value) {
+          params.set("date", dateInput.value);
+        }
+        window.location.href = "/xsp-bot/trades?" + params.toString();
+      }
+      select.addEventListener("change", function () { showFieldsFor(select.value); navigate(); });
+      dateInput.addEventListener("change", navigate);
+      monthInput.addEventListener("change", navigate);
+    })();
+  </script>
 </body></html>`);
   } catch (err) {
     res.status(500).send(`<pre>Error loading trades: ${escapeHtml(err.message)}</pre>`);
