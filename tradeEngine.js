@@ -127,6 +127,31 @@ const SIMULATED_WALLET_SIZE = 500;
 // scheduled job, not so wide that it starts reacting to stale-by-hours moves.
 const SIGNAL_LOOKBACK_BARS = 3;
 
+// Fixed take-profit, added after backtesting it against the live bot's own
+// pure-trailing-stop behavior on 90 days of real bars across the whole
+// watchlist (see backtest.js's ?takeProfitPct= A/B lever -- this is not a
+// guess). Results, all on the SAME 90-day window/symbols for a fair
+// comparison:
+//   pure trailing stop (old default): 217 trades, 82W/135L (37.8%), +$4,746.56
+//   fixed take-profit at 50%:          264 trades, 109W/155L (41.3%), +$5,767.23
+//   fixed take-profit at 75%:          243 trades, 93W/150L (38.3%), +$6,086.76
+//   fixed take-profit at 100%:         224 trades, 84W/140L (37.5%), +$6,053.16
+// 75% and 100% are close and both clearly beat pure trailing-stop and the
+// 50% cap; 75% is picked as the default since it edged out 100% on total
+// P&L in this test. The trailing stop below is NOT removed -- it still
+// protects a winner that never reaches this fixed target, and still governs
+// the stop-loss side entirely. This only adds an extra, earlier exit door
+// once a trade is up TAKE_PROFIT_PCT%, instead of always waiting for the
+// ratchet to give back a step first.
+//
+// IMPORTANT ASYMMETRY: the same A/B test run against the index bot (XSP/SPX,
+// via xspTradeEngine.js) showed the OPPOSITE result -- a fixed take-profit
+// made both instruments' backtested P&L worse, not better. That engine
+// deliberately does NOT import or use this constant; see its own exit
+// function for why it stays pure-trailing-stop. Don't "fix" that as an
+// oversight -- it's the data-backed choice for that engine specifically.
+const TAKE_PROFIT_PCT = 75;
+
 // Same principle as the manual tool's liquidity screener: a strike that's
 // technically "closest to spot" isn't worth trading if almost nobody else
 // is trading it — a thin contract means bad fills and unreliable prices,
@@ -367,41 +392,49 @@ async function computeLiveLevels(position) {
 }
 
 // ---- EXIT -------------------------------------------------------------------
-// Exit is driven ENTIRELY by the trailing stop now — no fixed take-profit.
-// Below +40% peak profit, that stop is just the initial 45%-loss line;
-// above it, the stop ratchets up in 20% steps and never gives back more
-// than one step's worth of profit, letting a winner run instead of getting
-// cut off at an arbitrary fixed target. targetLevel is still shown on the
-// dashboard as a reference (where structure suggests price could go), but
-// it no longer triggers a close.
+// Exit is the trailing stop PLUS a fixed take-profit door (see
+// TAKE_PROFIT_PCT's comment above for the backtest evidence behind adding
+// this back). Below +40% peak profit, the stop is just the initial
+// 45%-loss line; above it, the stop ratchets up in 20% steps and never
+// gives back more than one step's worth of profit. Whichever of the two
+// exit conditions is reached first wins -- same "first condition in bar
+// order" rule backtestSymbol already used for this A/B lever, so live
+// behavior now matches exactly what was backtested. targetLevel is still
+// shown on the dashboard as a reference (where structure suggests price
+// could go), but it still never triggers a close on its own.
 async function evaluateAndMaybeExit(position) {
   const levels = await computeLiveLevels(position);
   if (levels.error) return { action: "hold", reason: levels.error };
 
-  const { parsed, netIfSoldNow, trailStop, peakNet, targetLevel } = levels;
+  const { parsed, netIfSoldNow, trailStop, peakNet, targetLevel, entryCostWithFee } = levels;
+  const fixedTP = TAKE_PROFIT_PCT != null ? +(entryCostWithFee * (1 + TAKE_PROFIT_PCT / 100)).toFixed(2) : null;
+  const hitFixedTP = fixedTP != null && netIfSoldNow >= fixedTP;
 
-  if (netIfSoldNow <= trailStop) {
+  if (hitFixedTP || netIfSoldNow <= trailStop) {
     const closeOrder = await alpacaClient.closePosition(position.symbol);
     // Position is done -- drop its remembered peak so nothing stale lingers
     // (see peakStore.clearPeak's comment for why this matters, however
     // unlikely). pruneToSymbols (in runCycle) would eventually catch this
     // too, but clearing it immediately is free and more precise.
     peakStore.clearPeak(position.symbol);
-    const exitReason = trailStop > levels.entryCostWithFee ? "trailing-stop (locked in profit)" : "stop-loss";
+    const exitReason = hitFixedTP
+      ? "take-profit"
+      : (trailStop > levels.entryCostWithFee ? "trailing-stop (locked in profit)" : "stop-loss");
+    const thresholdHit = hitFixedTP ? fixedTP : trailStop;
     await notify(
       `Closed: ${parsed.root}`,
-      `Closed ${position.symbol} — net proceeds $${netIfSoldNow} <= stop $${trailStop} (peak was $${peakNet}).`
+      `Closed ${position.symbol} — net proceeds $${netIfSoldNow} ${hitFixedTP ? ">=" : "<="} ${hitFixedTP ? "take-profit" : "stop"} $${thresholdHit} (peak was $${peakNet}).`
     );
     return {
       action: "exited", exitReason, symbol: parsed.root,
-      netProceeds: netIfSoldNow, trailStop, peakNet, closeOrder,
-      reason: `${exitReason} hit: net proceeds $${netIfSoldNow} <= stop $${trailStop} (peak reached $${peakNet}). Closed ${position.symbol}.`,
+      netProceeds: netIfSoldNow, trailStop, fixedTP, peakNet, closeOrder,
+      reason: `${exitReason} hit: net proceeds $${netIfSoldNow} vs stop $${trailStop}${fixedTP != null ? ` / take-profit $${fixedTP}` : ""} (peak reached $${peakNet}). Closed ${position.symbol}.`,
     };
   }
 
   return {
-    action: "hold", symbol: parsed.root, netIfSoldNow, trailStop, peakNet, targetLevel,
-    reason: `Holding ${position.symbol}: net now $${netIfSoldNow}, trailing stop $${trailStop} (peak $${peakNet}), reference target ${targetLevel != null ? "$" + targetLevel : "n/a yet"}.`,
+    action: "hold", symbol: parsed.root, netIfSoldNow, trailStop, fixedTP, peakNet, targetLevel,
+    reason: `Holding ${position.symbol}: net now $${netIfSoldNow}, trailing stop $${trailStop}${fixedTP != null ? `, take-profit $${fixedTP}` : ""} (peak $${peakNet}), reference target ${targetLevel != null ? "$" + targetLevel : "n/a yet"}.`,
   };
 }
 
@@ -543,6 +576,7 @@ module.exports = {
   CONTRACTS_PER_TRADE,
   SIGNAL_LOOKBACK_BARS,
   SIMULATED_WALLET_SIZE,
+  TAKE_PROFIT_PCT,
   liquidityThresholdFor,
   yearsUntil,
   positionBelongsTo,
