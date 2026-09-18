@@ -89,6 +89,23 @@ function backtestSymbol(bars, {
   windowSize = 100,
   volWindow = 20,
   swingStrength = 2,
+  // Optional A/B lever for comparing strategies head-to-head on the same
+  // historical bars: null (default) = the live bot's actual behavior, pure
+  // trailing stop, no cap on the upside. A number (e.g. 75) adds a FIXED
+  // take-profit at that % gain over entry — once net proceeds reach it, the
+  // trade closes immediately instead of letting the trailing stop keep
+  // riding. Whichever condition is reached first, in bar order, wins; if
+  // both would trigger on the same bar the fixed take-profit is treated as
+  // reached first (it's a deliberate target, not a fallback).
+  takeProfitPct = null,
+  // Scales `bar.c` before it's used as the underlying spot for strike
+  // selection / Black-Scholes pricing -- default 1 means "use the bars as
+  // given" (the stock engine's and XSP's own behavior, unchanged). Exists
+  // for backtesting full SPX via a SPY-bars proxy: SPX ≈ SPY * 10, so
+  // passing spotMultiplier: 10 makes the simulated strikes/premiums land at
+  // SPX's real scale instead of SPY's, without duplicating this whole
+  // function for one multiplication.
+  spotMultiplier = 1,
 } = {}) {
   const trades = [];
   let position = null;
@@ -97,22 +114,29 @@ function backtestSymbol(bars, {
   for (let i = minBarsNeeded; i < bars.length; i++) {
     const bar = bars[i];
     const now = new Date(bar.t);
+    const scaledClose = bar.c * spotMultiplier;
 
     if (position) {
       const T = yearsUntilAsOf(position.expirationDate, now);
       let perShare, expired = false;
       if (T <= 0) {
-        perShare = Math.max(position.type === "call" ? bar.c - position.strike : position.strike - bar.c, 0);
+        perShare = Math.max(position.type === "call" ? scaledClose - position.strike : position.strike - scaledClose, 0);
         expired = true;
       } else {
-        perShare = blackScholes(bar.c, position.strike, T, riskFreeRate, position.iv, position.type).price;
+        perShare = blackScholes(scaledClose, position.strike, T, riskFreeRate, position.iv, position.type).price;
       }
       const netAtBar = +(perShare * 100 - exitFee).toFixed(2);
       if (netAtBar > position.peakNet) position.peakNet = netAtBar;
       const trailStop = tradeEngine.trailingStopLevel(position.entryCostWithFee, position.peakNet, position.ladder);
+      const hitFixedTP = position.fixedTP != null && netAtBar >= position.fixedTP;
 
-      if (expired || netAtBar <= trailStop) {
+      if (expired || hitFixedTP || netAtBar <= trailStop) {
         const pnl = +(netAtBar - position.entryCostWithFee).toFixed(2);
+        const exitReason = expired
+          ? "expired"
+          : hitFixedTP
+          ? "take-profit"
+          : (trailStop > position.entryCostWithFee ? "trailing-stop" : "stop-loss");
         trades.push({
           direction: position.type,
           entryTime: position.entryTime,
@@ -124,7 +148,7 @@ function backtestSymbol(bars, {
           peakNet: position.peakNet,
           pnl,
           outcome: pnl > 0 ? "win" : "loss",
-          exitReason: expired ? "expired" : (trailStop > position.entryCostWithFee ? "trailing-stop" : "stop-loss"),
+          exitReason,
         });
         position = null;
       }
@@ -138,7 +162,7 @@ function backtestSymbol(bars, {
     const analysis = findLatestSignal(windowBars, { swingStrength, lookback });
     if (!analysis.signal) continue;
 
-    const spot = bar.c;
+    const spot = scaledClose;
     const direction = analysis.signal.direction;
     const strike = Math.round(spot);
     const expirationDate = nextFridayExpiration(now, minDaysOut);
@@ -155,6 +179,7 @@ function backtestSymbol(bars, {
       entryTime: bar.t, entryCostWithFee,
       peakNet: +(contractCost - exitFee).toFixed(2),
       ladder: initialLadder(entryCostWithFee),
+      fixedTP: takeProfitPct != null ? +(entryCostWithFee * (1 + takeProfitPct / 100)).toFixed(2) : null,
     };
   }
 
@@ -169,7 +194,7 @@ function backtestSymbol(bars, {
 // aggregating into the win/loss probability the user asked for. Needs live
 // Alpaca access (only reachable once deployed — this dev sandbox can't
 // reach data.alpaca.markets directly).
-async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit = 10000 } = {}) {
+async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit = 10000, takeProfitPct = null } = {}) {
   const bySymbol = {};
   const allTrades = [];
 
@@ -177,7 +202,7 @@ async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit
     try {
       const bars = await alpacaClient.getBars(symbol, { timeframe: "15Min", limit, daysBack });
       if (!bars.length) { bySymbol[symbol] = { error: "No bars returned for this symbol/window." }; continue; }
-      const { trades, stillOpen } = backtestSymbol(bars);
+      const { trades, stillOpen } = backtestSymbol(bars, { takeProfitPct });
       const tagged = trades.map((t) => ({ ...t, symbol }));
       allTrades.push(...tagged);
       const wins = tagged.filter((t) => t.outcome === "win").length;
@@ -205,6 +230,7 @@ async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit
     generatedAt: new Date().toISOString(),
     daysBack,
     symbols,
+    takeProfitPct, // null = pure trailing stop (the live bot's real behavior); a number = fixed-TP comparison mode
     summary: {
       completedTrades,
       wins,
