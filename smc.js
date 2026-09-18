@@ -148,6 +148,97 @@ function nearestTarget(swings, direction, spot) {
   return candidates[0] || null;
 }
 
+// ---- ICT ADDITIONS (SMT/ICT Version only -- NOT present in the Options
+// Version's smc.js): order blocks + liquidity sweeps. See the research
+// summary given to the user for sourcing; short version of each rule below.
+
+// Groups nearby swing points of the SAME type into "equal level" clusters —
+// ICT's "liquidity pools": several swing highs (or lows) sitting within
+// `tolerancePct` of each other are read as a resting cluster of stop orders
+// (buy-side liquidity above equal highs, sell-side liquidity below equal
+// lows) — a stronger magnet for price than any single swing point alone.
+// Only clusters with 2+ members are returned; a lone swing isn't "equal" to
+// anything. detectLiquiditySweep below also accepts single swings as a
+// weaker fallback so a real sweep isn't missed just because no exact
+// cluster formed.
+function detectEqualLevels(swings, tolerancePct = 0.15) {
+  const clusters = [];
+  for (const type of ["high", "low"]) {
+    const points = swings.filter((s) => s.type === type).sort((a, b) => a.price - b.price);
+    let current = [];
+    for (const p of points) {
+      if (current.length && (Math.abs(p.price - current[current.length - 1].price) / current[current.length - 1].price) * 100 > tolerancePct) {
+        if (current.length >= 2) clusters.push({ type, price: current.reduce((s, c) => s + c.price, 0) / current.length, swings: current.slice() });
+        current = [];
+      }
+      current.push(p);
+    }
+    if (current.length >= 2) clusters.push({ type, price: current.reduce((s, c) => s + c.price, 0) / current.length, swings: current.slice() });
+  }
+  return clusters;
+}
+
+// A liquidity sweep: price wicks BEYOND a prior swing point (or, more
+// powerfully, a whole equal-level cluster) — the classic ICT "stop hunt" —
+// and then CLOSES back on the other side of it. The wick proves stops
+// actually got triggered there; the close-back proves it was a trap, not a
+// real breakout — this is the mechanism behind the ICT "Judas Swing."
+//
+// direction "call" looks for a SELL-SIDE sweep (wick below an old low,
+// close back above it) — bullish, since downside stops are now spent.
+// direction "put" looks for a BUY-SIDE sweep (wick above an old high,
+// close back below it) — bearish, upside stops now spent.
+//
+// Only considers swings/clusters that are already confirmed BEFORE the bar
+// being checked (findSwings' fractal definition guarantees every swing it
+// returns already has `strength` bars confirmed after it, so this is a
+// belt-and-suspenders check, not strictly required). At each bar, picks the
+// level CLOSEST to that bar's close — the most locally relevant liquidity,
+// not some unrelated level from far away in price. Scans the whole lookback
+// window and keeps the LAST (most recent) match, since a live trading
+// decision cares about the freshest sweep, not the first one found.
+function detectLiquiditySweep(bars, swings, direction, { lookback = 10 } = {}) {
+  const wantType = direction === "call" ? "low" : "high";
+  const equalLevels = detectEqualLevels(swings).filter((c) => c.type === wantType);
+  const startIdx = Math.max(0, bars.length - lookback);
+  let result = { swept: false };
+
+  for (let i = startIdx; i < bars.length; i++) {
+    const bar = bars[i];
+    const candidates = [
+      ...equalLevels.map((c) => ({ price: c.price, strength: "equal-level", clusterSize: c.swings.length, lastIndex: Math.max(...c.swings.map((s) => s.index)) })),
+      ...swings.filter((s) => s.type === wantType).map((s) => ({ price: s.price, strength: "single-swing", clusterSize: 1, lastIndex: s.index })),
+    ].filter((c) => c.lastIndex < i);
+    if (!candidates.length) continue;
+    candidates.sort((a, b) => Math.abs(a.price - bar.c) - Math.abs(b.price - bar.c));
+    const level = candidates[0];
+    const sweptNow = direction === "call" ? bar.l < level.price && bar.c > level.price : bar.h > level.price && bar.c < level.price;
+    if (sweptNow) {
+      result = { swept: true, level: level.price, strength: level.strength, clusterSize: level.clusterSize, barIndex: i, barTime: bar.t };
+    }
+  }
+  return result;
+}
+
+// The order block behind a structure break: the LAST opposite-colored
+// candle before the impulse leg that produced the break. A bullish order
+// block (a support zone institutions are thought to have bought from) is
+// the last bearish (red) candle before a bullish impulse; a bearish order
+// block (resistance/supply) is the last bullish (green) candle before a
+// bearish impulse. `event` is one entry from detectStructureBreaks.
+function findOrderBlock(bars, event) {
+  const wantBearishCandle = event.direction === "bullish"; // bullish impulse -> look for the last RED candle before it
+  for (let i = event.barIndex - 1; i >= 0; i--) {
+    const bar = bars[i];
+    const isBearishCandle = bar.c < bar.o;
+    const isBullishCandle = bar.c > bar.o;
+    if ((wantBearishCandle && isBearishCandle) || (!wantBearishCandle && isBullishCandle)) {
+      return { type: event.direction, top: bar.h, bottom: bar.l, formedAtIndex: i, formedAt: bar.t };
+    }
+  }
+  return null;
+}
+
 // Top-level entry point: run every detector and, if the most recent bar just
 // produced a BOS/CHoCH, turn that into an actual tradeable signal (direction
 // + nearest matching unfilled FVG as the entry zone + nearest swing point
@@ -182,11 +273,30 @@ function findLatestSignal(bars, { swingStrength = 2, lookback = 1 } = {}) {
 
   const target = nearestTarget(swings, direction, lastBar.c);
 
+  // SMT/ICT Version addition: a plain BOS/CHoCH is common noise on its own
+  // (that's exactly why the Options Version's live win rate needed the
+  // trailing-stop work it got). `confirmed` requires BOTH an order block
+  // behind this exact break (proof of where the "impulse" actually
+  // originated) AND a recent liquidity sweep in this direction (proof price
+  // just ran stops before reversing/continuing, not just drifting through a
+  // level). evaluateAndMaybeEnter only trades when confirmed is true —
+  // unconfirmed signals are still returned here (for visibility/backtesting
+  // comparison) but are meant to be skipped, not acted on.
+  const orderBlock = findOrderBlock(bars, event);
+  const liquiditySweep = detectLiquiditySweep(bars, swings, direction);
+  const confirmed = !!(orderBlock && liquiditySweep.swept);
+
   return {
-    signal: { direction, event, spot: lastBar.c, entryZone, target: target ? target.price : null },
+    signal: { direction, event, spot: lastBar.c, entryZone, target: target ? target.price : null, orderBlock, liquiditySweep, confirmed },
     trend, swings, structureEvents, fvgs,
-    reason: `${event.type} (${event.direction}) at ${event.brokenLevel} -> bias ${direction.toUpperCase()}.`,
+    reason: `${event.type} (${event.direction}) at ${event.brokenLevel} -> bias ${direction.toUpperCase()}.`
+      + (confirmed
+        ? ` CONFIRMED: order block at ${orderBlock.bottom}-${orderBlock.top} + liquidity sweep (${liquiditySweep.strength}) of ${liquiditySweep.level}.`
+        : ` NOT confirmed (${orderBlock ? "" : "no order block found; "}${liquiditySweep.swept ? "" : "no recent liquidity sweep"}) -- would be skipped by evaluateAndMaybeEnter.`),
   };
 }
 
-module.exports = { findSwings, determineTrend, detectStructureBreaks, detectFVGs, nearestTarget, findLatestSignal };
+module.exports = {
+  findSwings, determineTrend, detectStructureBreaks, detectFVGs, nearestTarget, findLatestSignal,
+  detectEqualLevels, detectLiquiditySweep, findOrderBlock,
+};
