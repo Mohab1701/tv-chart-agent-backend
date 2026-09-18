@@ -125,20 +125,29 @@ router.get("/run-cycle", async (req, res) => {
 // deep historical options-chain data — see backtest.js's top comment and
 // the `caveats` field in the response for exactly what's approximated and
 // why. Query params: ?daysBack=90 (default; how far back to pull bars) and
-// ?symbols=NVDA,TSLA (default: the full watchlist). ?takeProfitPct=75 runs
-// the A/B comparison mode: closes a trade the instant it reaches that fixed
-// % gain instead of letting the trailing stop keep riding — omit it (the
-// default) to test the live bot's actual behavior, pure trailing stop with
-// no cap.
+// ?symbols=NVDA,TSLA (default: the full watchlist).
+//
+// ?takeProfitPct=75 overrides the fixed take-profit for this run only. Omit
+// it entirely (the default) and this now matches the LIVE bot's actual
+// behavior — tradeEngine.TAKE_PROFIT_PCT (75% as of this comment; see that
+// constant's own comment for the A/B evidence behind picking it) — rather
+// than the old "omit = pure trailing stop" default, since the live bot
+// itself is no longer pure-trailing-stop-only. To specifically re-test the
+// OLD pure-trailing-stop-only behavior for comparison, pass
+// ?takeProfitPct=none.
 router.get("/backtest", async (req, res) => {
   try {
     const daysBack = req.query.daysBack ? parseInt(req.query.daysBack, 10) : 90;
     const symbols = req.query.symbols
       ? req.query.symbols.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)
       : tradeEngine.SYMBOLS;
-    const takeProfitPct = req.query.takeProfitPct != null && req.query.takeProfitPct !== ""
-      ? parseFloat(req.query.takeProfitPct)
-      : null;
+    const takeProfitPctRaw = req.query.takeProfitPct;
+    const takeProfitPct =
+      takeProfitPctRaw === "none" || takeProfitPctRaw === "off"
+        ? null
+        : takeProfitPctRaw != null && takeProfitPctRaw !== ""
+        ? parseFloat(takeProfitPctRaw)
+        : tradeEngine.TAKE_PROFIT_PCT;
     const result = await runBacktest({ symbols, daysBack, takeProfitPct });
     res.json(result);
   } catch (err) {
