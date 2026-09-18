@@ -1,0 +1,27 @@
+name: xsp-bot run-cycle (SMT/ICT test service)
+
+# Same purpose as paper-bot-cycle.yml, just for the index-options track
+# (XSP + SPX, mounted at /xsp-bot/*) on the SMT/ICT Version's own separate
+# Render service. This workflow did not exist before on ANY branch -- the
+# index bot's run-cycle has never had a scheduled trigger, on production or
+# here -- so without this, /xsp-bot/trades would only ever update after a
+# manual visit to /xsp-bot/run-cycle. This file only adds automation to the
+# SMT/ICT test service; production's index bot is untouched and still has
+# no scheduled trigger of its own (a separate, pre-existing gap, out of
+# scope for this branch).
+#
+# Same market-hours cadence as the stock bot's cycle, and the same
+# cold-start-tolerant retry-once pattern.
+on:
+  schedule:
+    - cron: "*/5 13-21 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  run-cycle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit /xsp-bot/run-cycle (retry once, in case Render is cold-starting)
+        run: |
+          URL="https://tv-chart-agent-backend-smtict.onrender.com/xsp-bot/run-cycle"
+          curl -sS -f --max-time 90 "$URL" || curl -sS -f --max-time 90 "$URL"
