@@ -52,6 +52,17 @@ function nextFridayExpiration(asOfDate, minDaysOut) {
   return d.toISOString().slice(0, 10);
 }
 
+// Same calendar date as `asOfDate`, for the zeroDte lever below. SPX/SPXW
+// (unlike the 9 stock-watchlist symbols) actually lists a real expiration
+// EVERY weekday, not just Fridays -- so "0DTE" for these means "expires
+// today," any day of the week. This is NOT what nextFridayExpiration models
+// (it only ever lands on a Friday, up to minDaysOut+4 days out), which is
+// why minDaysOut alone can't approximate same-day expiration -- setting it
+// to 0 on a Monday still finds that week's Friday, four days later.
+function sameDayExpiration(asOfDate) {
+  return asOfDate.toISOString().slice(0, 10);
+}
+
 // Rolling realized volatility (annualized) from the underlying's own bars,
 // used as a stand-in for implied volatility since real historical IV isn't
 // available. Options IV usually sits a bit ABOVE realized vol (a volatility
@@ -106,6 +117,13 @@ function backtestSymbol(bars, {
   // SPX's real scale instead of SPY's, without duplicating this whole
   // function for one multiplication.
   spotMultiplier = 1,
+  // Opt-in, curiosity/comparison lever -- NOT used by any live engine and
+  // NOT the default here either. When true, every entry targets an
+  // expiration on the SAME calendar day as the entry bar (see
+  // sameDayExpiration above) instead of the next-Friday approximation,
+  // approximating SPX/SPXW's real same-day (0DTE) weekly-series contracts.
+  // Overrides minDaysOut entirely when set (0DTE has no "days out").
+  zeroDte = false,
 } = {}) {
   const trades = [];
   let position = null;
@@ -165,7 +183,7 @@ function backtestSymbol(bars, {
     const spot = scaledClose;
     const direction = analysis.signal.direction;
     const strike = Math.round(spot);
-    const expirationDate = nextFridayExpiration(now, minDaysOut);
+    const expirationDate = zeroDte ? sameDayExpiration(now) : nextFridayExpiration(now, minDaysOut);
     const T = yearsUntilAsOf(expirationDate, now);
     if (T <= 0) continue;
     const iv = realizedVolAt(bars, i, volWindow);
