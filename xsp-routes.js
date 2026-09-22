@@ -96,12 +96,23 @@ router.get("/run-cycle", async (req, res) => {
 // (one Alpaca history call either way). The liquidity filter still can't
 // be replayed historically (no historical options volume/OI data exists)
 // — same limitation as the stock backtest, see backtest.js's top comment.
+//
+// ?zeroDte=true — curiosity/comparison lever, NOT the live engine's
+// behavior and NOT the default. Every entry targets an expiration on the
+// SAME calendar day instead of the next-Friday approximation, i.e. what a
+// 0DTE SPX/SPXW strategy would have done on these same historical bars.
+// The live engine deliberately never does this (MIN_DAYS_OUT = 1 excludes
+// same-day-expiration contracts entirely) — see xspTradeEngine.js's own
+// comment on MIN_DAYS_OUT for why. This flag exists purely to let that
+// choice be checked against real numbers on request, not to suggest 0DTE
+// is being considered for the live bot.
 router.get("/backtest", async (req, res) => {
   try {
     const daysBack = req.query.daysBack ? parseInt(req.query.daysBack, 10) : 90;
     const takeProfitPct = req.query.takeProfitPct != null && req.query.takeProfitPct !== ""
       ? parseFloat(req.query.takeProfitPct)
       : null;
+    const zeroDte = req.query.zeroDte === "true" || req.query.zeroDte === "1";
     const requestedSymbol = req.query.symbol ? String(req.query.symbol).trim().toUpperCase() : null;
     const instruments = requestedSymbol
       ? xspEngine.INSTRUMENTS.filter((i) => i.tradeSymbol === requestedSymbol)
@@ -126,6 +137,7 @@ router.get("/backtest", async (req, res) => {
         exitFee: xspEngine.EXIT_FEE,
         spotMultiplier: instrument.proxyMultiplier,
         takeProfitPct,
+        zeroDte,
       });
       const tagged = trades.map((t) => ({ ...t, symbol: instrument.tradeSymbol }));
       const wins = tagged.filter((t) => t.outcome === "win").length;
@@ -152,12 +164,15 @@ router.get("/backtest", async (req, res) => {
       daysBack,
       proxySymbol: xspEngine.PROXY_SYMBOL,
       takeProfitPct,
+      zeroDte,
       results: byInstrument,
       caveats: [
         "Signal detection runs on SPY's real historical bars (a proxy for XSP/SPX's own level, since Alpaca doesn't provide historical index data) — not either index's own price history directly.",
         "Options pricing is APPROXIMATED (Black-Scholes with volatility estimated from SPY's own recent realized moves) — Alpaca has no deep historical options quote data to replay exactly.",
         "SPX figures scale SPY's close by x10 (proxyMultiplier) for strike/pricing purposes only — this has NOT been cross-checked against SPX's own real historical prices, which can diverge slightly from a pure x10 relationship intraday.",
-        "Strike = nearest whole dollar to the scaled proxy spot at entry; expiration = next Friday at least 1 day out.",
+        zeroDte
+          ? "zeroDte=true: expiration = SAME DAY as entry (approximating a 0DTE SPX/SPXW strategy), NOT the next-Friday approximation the live engine actually uses -- MIN_DAYS_OUT=1 in xspTradeEngine.js deliberately excludes same-day-expiration contracts live, so these results describe a strategy this bot does NOT run, for comparison only."
+          : "Strike = nearest whole dollar to the scaled proxy spot at entry; expiration = next Friday at least 1 day out.",
         "The live liquidity filter (skip thin volume/open-interest contracts) and the SMT/ICT order-block + liquidity-sweep confirmation gate could not both be replayed exactly as the live bot applies them -- findLatestSignal's confirmed flag IS evaluated per bar here (same function, same rule), but there is no historical options volume/OI to check the liquidity filter against.",
       ],
     });
