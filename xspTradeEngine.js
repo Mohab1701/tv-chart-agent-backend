@@ -45,7 +45,25 @@ const PROXY_SYMBOL = "SPY";
 
 const ENTRY_FEE = 3;
 const EXIT_FEE = 3;
-const MIN_DAYS_OUT = 1;
+// Changed 1 -> 0 on 2026-09-22 at the user's explicit request, after a
+// zeroDte backtest (see xsp-routes.js's /xsp-bot/backtest?zeroDte=true and
+// backtest.js) showed a positive-but-high-variance profile (XSP: 33.9% win
+// rate, SPX: 38.3% win rate, both net positive over a 90-day sample).
+// selectAtmContract() (alpacaClient.js) uses this as `expirationDateGte`
+// against Alpaca's REAL listed contracts (not the backtest's synthetic
+// same-day approximation) -- so 0 here means "today's date or later,"
+// which only actually pulls in a same-day (0DTE) contract on days Alpaca
+// lists one for XSP/SPX (both list real daily expirations, unlike the
+// stock watchlist's Friday-only series).
+//
+// KNOWN RISK, carried over unchanged from the stock engine's own MIN_DAYS_OUT
+// comment: this bot's run-cycle is only polled every 5 minutes (via
+// cron-job.org). A 0DTE contract can move (and decay) far more between polls
+// than a multi-day contract, so a stop-loss or take-profit exit can lag the
+// actual peak/trough by up to one poll cycle. This is a real live-execution
+// risk the zeroDte backtest does NOT model (it assumes exits fire exactly
+// at the trigger price, every bar).
+const MIN_DAYS_OUT = 0;
 const RISK_FREE_RATE = 0.05;
 const CONTRACTS_PER_TRADE = 1;
 const SIGNAL_LOOKBACK_BARS = 3; // same freshness window as the stock engine
