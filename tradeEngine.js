@@ -1,238 +1,144 @@
-// The actual decision-making brain of the paper-bot: given a symbol, either
-// enter a NEW position (if a fresh SMC signal just fired and passes the
-// filters) or check an EXISTING position against its target/stop and close
-// it if either is crossed. Nothing here is triggered on its own — something
-// external has to call runCycle() periodically (see the GitHub Actions
-// workflow that hits /paper-bot/run-cycle).
+// A SEPARATE decision engine for trading INDEX options — XSP (Mini-SPX) and
+// SPX (full-size SPX) — entirely independent of tradeEngine.js's stock
+// watchlist, mirroring how the whole paper-bot track is kept separate from
+// the original manual tool. Shares only pure library code (smc.js,
+// blackScholes.js, alpacaClient.js, peakStore.js) plus two small pieces of
+// tradeEngine.js (notify, trailingStopLevel, getClosedTrades) that are
+// genuinely identical math/plumbing, not index-specific — reusing them
+// instead of copy-pasting keeps the ratchet logic and notification
+// behavior from silently drifting between engines.
 //
-// Design note on WHY there's no local database of trades: Alpaca itself
-// durably stores avg_entry_price/current_price/unrealized_pl on every open
-// position and the full fill history on every order, on Alpaca's own
-// servers — completely unaffected by this app restarting or redeploying
-// (which, on Render's free tier, wipes local disk). So target/stop are
-// re-derived FRESH from Alpaca + live market data on every check, rather
-// than saved anywhere by us. That also means a target naturally updates as
-// price structure evolves while a trade is open, instead of being frozen
-// at entry.
+// WHY THIS ISN'T AS SIMPLE AS "run the stock engine on symbol XSP/SPX":
+// Alpaca can trade both (they're on Alpaca's supported index-options list),
+// but as of this writing Alpaca does NOT provide market data (bars/quotes)
+// for either index directly — their own docs say index data is "coming
+// months" away. Both are INDEX options, not ETFs, so there's no tradable
+// underlying to pull bars for directly.
 //
-// Fee convention (confirmed with the user): $3 charged on entry AND $3
-// charged on exit — a real $6 round-trip cost baked into every number this
-// module reports or acts on.
+// The fix: XSP's index level is designed to track 1/10th of SPX — and so is
+// SPY (the ETF). That means SPY's own price, which Alpaca fully supports,
+// is an excellent live proxy for XSP's level with NO conversion needed. For
+// full SPX, the same SPY price needs multiplying by 10 (SPX ≈ SPY × 10) —
+// see `proxyMultiplier` on each instrument below. Signal detection
+// (trend/BOS/CHoCH/order-block/liquidity-sweep) runs ONCE per cycle on
+// SPY's real bars and is shared by both instruments (they're both just
+// scaled views of the same underlying index move) — only strike selection
+// and Black-Scholes pricing apply each instrument's own multiplier. Nothing
+// about SPY itself is ever bought or held — it's a read-only price proxy.
+//
+// UNVERIFIED ASSUMPTION (flagged, not silently assumed): this file assumes
+// Alpaca's paper environment accepts "SPX" as an options underlying_symbol
+// the same way it already does for "XSP". That has NOT been confirmed live
+// (this sandbox has no Alpaca credentials to check) — some brokers only
+// expose SPX weeklies under a different root ("SPXW"). If SPX contracts
+// come back empty every cycle once this is live, that's the first thing to
+// check via Alpaca's own options-contracts endpoint/docs.
 const alpacaClient = require("./alpacaClient");
-const { findSwings, findLatestSignal, nearestTarget } = require("./smc");
+const { findLatestSignal } = require("./smc");
 const { blackScholes, impliedVolatility, initialLadder } = require("./blackScholes");
-const peakStore = require("./peakStore");
+const stockEngine = require("./tradeEngine"); // reused: notify(), trailingStopLevel(), getClosedTrades()
+const peakStore = require("./peakStore"); // same real-observed-peak store the stock engine uses (see peakStore.js)
 
-// Push notifications -- reads the topic name from an env var, same
-// discipline as the Alpaca keys: never hardcode it into a committed file.
-// If NTFY_TOPIC isn't set, notifications are silently skipped (never
-// blocks or breaks an actual trade action over a notification failing).
-//
-// IMPORTANT: fetch() does NOT throw on an HTTP error status (400, 429,
-// etc.) -- it only throws on a real network failure. The original version
-// of this function just did `await fetch(...)` and assumed success if
-// nothing threw, which meant a real rejection would be silently swallowed
-// and every caller -- including the /test-notify route -- would report
-// "sent successfully" even though nothing actually went out. Now the
-// response status/body is checked explicitly and returned/logged either
-// way, so a real failure is visible instead of assumed away.
-//
-// NTFY_SERVER_URL: confirmed live on 2026-09-10 that ntfy.sh's public
-// server enforces a 250 msgs/day quota tracked PER VISITOR IP for
-// unauthenticated publishes -- and Render's shared egress IPs mean that
-// quota can be silently exhausted by a completely unrelated Render
-// customer's traffic at any random time of day, with zero warning. Even
-// authenticating with a personal ntfy.sh access token did not bypass this
-// (still got rejected with the same 429). The durable fix: self-host a
-// dedicated ntfy instance (see magrabi-ntfy on Render, image
-// binwiederhier/ntfy, configured with NTFY_UPSTREAM_BASE_URL=https://ntfy.sh
-// for instant iOS push relay) so no other Render tenant's traffic can ever
-// touch this quota again. This env var points at that server; defaults to
-// the public ntfy.sh if not set, for backward compatibility.
-//
-// NTFY_ACCESS_TOKEN (optional, legacy): only relevant if still publishing
-// to the public ntfy.sh server -- ignored (harmlessly) when NTFY_SERVER_URL
-// points at a self-hosted instance with no auth configured.
-// Every notify() call in this file is about a trade entering or exiting,
-// so tapping the push notification should take you straight to the live
-// trades dashboard instead of just opening the ntfy app itself. ntfy
-// supports this via a "Click" header carrying a URL. Overridable via
-// TRADES_URL in case the deployed domain ever changes; defaults to the
-// known live URL otherwise.
-const TRADES_URL = process.env.TRADES_URL || "https://tv-chart-agent-backend.onrender.com/paper-bot/trades";
+// The real, Alpaca-supported ETF whose bars stand in for both indices' own
+// price series, since Alpaca can't provide index-level market data yet.
+const PROXY_SYMBOL = "SPY";
 
-async function notify(title, message) {
-  const topic = process.env.NTFY_TOPIC;
-  if (!topic) return { ok: false, reason: "NTFY_TOPIC is not set." };
-  const serverUrl = (process.env.NTFY_SERVER_URL || "https://ntfy.sh").replace(/\/+$/, "");
-  try {
-    const headers = { Title: title, Priority: "high", Click: TRADES_URL };
-    if (process.env.NTFY_ACCESS_TOKEN) {
-      headers["Authorization"] = `Bearer ${process.env.NTFY_ACCESS_TOKEN}`;
-    }
-    const resp = await fetch(`${serverUrl}/${encodeURIComponent(topic)}`, {
-      method: "POST",
-      headers,
-      body: message,
-    });
-    const bodyText = await resp.text().catch(() => "");
-    if (!resp.ok) {
-      console.error(`ntfy notification REJECTED (status ${resp.status}): ${bodyText}`);
-      return { ok: false, status: resp.status, body: bodyText };
-    }
-    return { ok: true, status: resp.status, body: bodyText };
-  } catch (err) {
-    console.error("ntfy notification failed (trade action itself is unaffected):", err.message);
-    return { ok: false, error: err.message };
-  }
-}
-
-// Watchlist — mega-cap, heavily-traded, consistently liquid optionable
-// names. Expanded from the original NVDA/TSLA/NFLX at the user's request to
-// cover more opportunities without adding thinner/more speculative tickers.
-const SYMBOLS = ["NVDA", "TSLA", "NFLX", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD"];
 const ENTRY_FEE = 3;
 const EXIT_FEE = 3;
-const MAX_CONTRACT_COST = 300; // skip a signal if the contract itself costs more than this (ask * 100), before fees
-const MIN_DAYS_OUT = 1; // never buy something expiring same-day — avoids a slow 15-min poll cycle missing a 0DTE exit
-const RISK_FREE_RATE = 0.05;
-const CONTRACTS_PER_TRADE = 1; // 1 contract per company, for now — each symbol tracked/closed independently, never stacked
-
-// SIMULATED wallet size -- NOT a real Alpaca balance check. The paper
-// account's actual buying power is whatever Alpaca's paper-trading default
-// is (plenty), so every order below would fill regardless of this number.
-// This exists purely so the BOT'S OWN entry decisions behave as if it were
-// already running on a real, small live account: before this existed, the
-// bot could have up to nine positions open at once (one per SYMBOL), each
-// up to MAX_CONTRACT_COST, with zero regard for total capital at risk --
-// fine on paper money, but not a real risk profile to have learned to
-// expect once real dollars are on the line. Every new entry now checks
-// this against capital already committed to OTHER open positions (see
-// evaluateAndMaybeEnter below) and skips if it would exceed it. With
-// MAX_CONTRACT_COST at $300, this means in practice the bot will mostly
-// hold ONE position at a time (two would need to total under $500
-// combined) -- that's intentional: it's what actually sizing for a $500
-// account looks like, not a bug.
-const SIMULATED_WALLET_SIZE = 500;
-
-// The engine only runs when something external hits /run-cycle (GitHub
-// Actions, every 15 min during market hours). If one cycle runs late — a
-// slow cold-start, a delayed CI runner, GitHub Actions itself lagging — the
-// OLD behavior (checking only the single most-recent bar) could miss a real
-// breakout FOREVER: by the time the next cycle finally checked, that bar was
-// no longer "last" and the break was gone from view. Widening the check to
-// the last few bars means a break that already happened and hasn't been
-// un-broken is still caught on the next check, even if that check is late.
-// 3 bars of 15-min data = up to 45 minutes of slack — generous for a
-// scheduled job, not so wide that it starts reacting to stale-by-hours moves.
-const SIGNAL_LOOKBACK_BARS = 3;
-
-// Fixed take-profit, added after backtesting it against the live bot's own
-// pure-trailing-stop behavior on 90 days of real bars across the whole
-// watchlist (see backtest.js's ?takeProfitPct= A/B lever -- this is not a
-// guess). Results, all on the SAME 90-day window/symbols for a fair
-// comparison:
-//   pure trailing stop (old default): 217 trades, 82W/135L (37.8%), +$4,746.56
-//   fixed take-profit at 50%:          264 trades, 109W/155L (41.3%), +$5,767.23
-//   fixed take-profit at 75%:          243 trades, 93W/150L (38.3%), +$6,086.76
-//   fixed take-profit at 100%:         224 trades, 84W/140L (37.5%), +$6,053.16
-// 75% and 100% are close and both clearly beat pure trailing-stop and the
-// 50% cap; 75% is picked as the default since it edged out 100% on total
-// P&L in this test. The trailing stop below is NOT removed -- it still
-// protects a winner that never reaches this fixed target, and still governs
-// the stop-loss side entirely. This only adds an extra, earlier exit door
-// once a trade is up TAKE_PROFIT_PCT%, instead of always waiting for the
-// ratchet to give back a step first.
+// Changed 1 -> 0 on 2026-09-22 at the user's explicit request, after a
+// zeroDte backtest (see xsp-routes.js's /xsp-bot/backtest?zeroDte=true and
+// backtest.js) showed a positive-but-high-variance profile (XSP: 33.9% win
+// rate, SPX: 38.3% win rate, both net positive over a 90-day sample).
+// selectAtmContract() (alpacaClient.js) uses this as `expirationDateGte`
+// against Alpaca's REAL listed contracts (not the backtest's synthetic
+// same-day approximation) -- so 0 here means "today's date or later,"
+// which only actually pulls in a same-day (0DTE) contract on days Alpaca
+// lists one for XSP/SPX (both list real daily expirations, unlike the
+// stock watchlist's Friday-only series).
 //
-// IMPORTANT ASYMMETRY: the same A/B test run against the index bot (XSP/SPX,
-// via xspTradeEngine.js) showed the OPPOSITE result -- a fixed take-profit
-// made both instruments' backtested P&L worse, not better. That engine
-// deliberately does NOT import or use this constant; see its own exit
-// function for why it stays pure-trailing-stop. Don't "fix" that as an
-// oversight -- it's the data-backed choice for that engine specifically.
-const TAKE_PROFIT_PCT = 75;
+// KNOWN RISK, carried over unchanged from the stock engine's own MIN_DAYS_OUT
+// comment: this bot's run-cycle is only polled every 5 minutes (via
+// cron-job.org). A 0DTE contract can move (and decay) far more between polls
+// than a multi-day contract, so a stop-loss or take-profit exit can lag the
+// actual peak/trough by up to one poll cycle. This is a real live-execution
+// risk the zeroDte backtest does NOT model (it assumes exits fire exactly
+// at the trigger price, every bar).
+const MIN_DAYS_OUT = 0;
+const RISK_FREE_RATE = 0.05;
+const CONTRACTS_PER_TRADE = 1;
+const SIGNAL_LOOKBACK_BARS = 3; // same freshness window as the stock engine
 
-// Same principle as the manual tool's liquidity screener: a strike that's
-// technically "closest to spot" isn't worth trading if almost nobody else
-// is trading it — a thin contract means bad fills and unreliable prices,
-// live or paper. Reject a candidate contract below its threshold even if
-// it's otherwise the perfect ATM strike. Numbers reused directly from the
-// manual tool's existing convention for NVDA/TSLA/NFLX; the newly added
-// mega-caps (AAPL/MSFT/AMZN/META/GOOGL/AMD) get the same tier since they're
-// comparably liquid, heavily-traded names.
-const LIQUIDITY_THRESHOLDS = {
-  NVDA: { minVolume: 100, minOpenInterest: 500 },
-  TSLA: { minVolume: 100, minOpenInterest: 500 },
-  NFLX: { minVolume: 100, minOpenInterest: 500 },
-  AAPL: { minVolume: 100, minOpenInterest: 500 },
-  MSFT: { minVolume: 100, minOpenInterest: 500 },
-  AMZN: { minVolume: 100, minOpenInterest: 500 },
-  META: { minVolume: 100, minOpenInterest: 500 },
-  GOOGL: { minVolume: 100, minOpenInterest: 500 },
-  AMD: { minVolume: 100, minOpenInterest: 500 },
-  DEFAULT: { minVolume: 50, minOpenInterest: 200 },
-};
-function liquidityThresholdFor(symbol) {
-  const key = String(symbol || "").trim().toUpperCase();
-  return LIQUIDITY_THRESHOLDS[key] || LIQUIDITY_THRESHOLDS.DEFAULT;
-}
+// Each index instrument this engine trades. Both share the SAME signal
+// (derived from one SPY bar fetch per cycle) but have their OWN contract
+// cost cap, liquidity bar, and price-scaling multiplier against SPY.
+const INSTRUMENTS = [
+  {
+    // "XSP" is the OCC root Alpaca uses for Mini-SPX index option contracts.
+    tradeSymbol: "XSP",
+    proxyMultiplier: 1, // XSP is designed to track SPX/10, same as SPY itself -- no scaling needed.
+    // XSP's own fact sheet gives a typical ATM example around $300/contract
+    // (index ~600, ATM premium ~$3.00 * $100 multiplier) — $500 leaves
+    // headroom for slightly ITM or longer-dated contracts without being
+    // unlimited.
+    maxContractCost: 500,
+    // XSP's WHOLE market trades roughly 50,000-150,000 contracts/day (Cboe)
+    // — a deliberately separate, XSP-scaled liquidity tier, not reused from
+    // the stock engine's mega-cap tier or a naive "SPX" assumption.
+    liquidityThreshold: { minVolume: 300, minOpenInterest: 1500 },
+  },
+  {
+    // Full-size SPX. NOT the same contract as XSP -- 10x the notional, its
+    // own OCC root, its own order book.
+    tradeSymbol: "SPX",
+    proxyMultiplier: 10, // full SPX tracks SPY * 10, unlike XSP which needs no scaling.
+    // SPX ATM premium is roughly 10x XSP's (index ~6000, ATM premium
+    // ~$30-$40 * $100 multiplier ≈ $3000-$4000) -- $5000 leaves similar
+    // proportional headroom to XSP's own $500 cap. UNTUNED starting point,
+    // meant to be revisited once a real backtest/live sample exists.
+    maxContractCost: 5000,
+    // SPX is the single most-traded index option in the world (1.5M+
+    // contracts/day) -- these thresholds are set conservatively low
+    // relative to that real liquidity (so real SPX flow clears them
+    // easily) rather than tuned tight, since there's no historical
+    // options-volume data available to calibrate against precisely.
+    liquidityThreshold: { minVolume: 1000, minOpenInterest: 3000 },
+  },
+];
 
 function yearsUntil(expirationDateStr) {
-  // Treat expiry as 4pm ET market close on that date. Using a fixed UTC
-  // offset (21:00 UTC) rather than proper timezone/DST math — close enough
-  // for a time-value estimate, same spirit as the manual tool's own
-  // simplifications.
   const expiry = new Date(`${expirationDateStr}T21:00:00Z`);
   const ms = expiry.getTime() - Date.now();
   return Math.max(ms, 0) / (365 * 24 * 60 * 60 * 1000);
 }
 
-// True if `position` (an Alpaca position object) belongs to `underlying`.
-function positionBelongsTo(position, underlying) {
+function positionBelongsTo(position, tradeSymbol) {
   const parsed = alpacaClient.parseOccSymbol(position.symbol);
-  return parsed && parsed.root === underlying;
-}
-
-// Sums entryCostWithFee (premium + the same $ENTRY_FEE convention used
-// everywhere else in this file) across every currently-open option
-// position, regardless of symbol -- i.e. total capital already committed,
-// for checking against SIMULATED_WALLET_SIZE before opening another one.
-function totalCommittedCapital(openPositions) {
-  return (openPositions || [])
-    .filter((p) => p.asset_class === "us_option")
-    .reduce((sum, p) => {
-      const qty = parseFloat(p.qty) || 1;
-      const perContract = parseFloat(p.avg_entry_price) * 100 + ENTRY_FEE;
-      return sum + perContract * qty;
-    }, 0);
+  return parsed && parsed.root === tradeSymbol;
 }
 
 // ---- ENTRY -----------------------------------------------------------------
-async function evaluateAndMaybeEnter(symbol) {
+// `analysis` (from findLatestSignal) and `proxySpot` (SPY's latest close)
+// are computed ONCE per cycle by runCycle and passed in here — both
+// instruments react to the same underlying signal, just scaled/filtered
+// differently, so there's no reason to re-fetch SPY bars or re-run
+// structure detection twice per cycle.
+async function evaluateAndMaybeEnter(instrument, analysis, proxySpot) {
   const openPositions = await alpacaClient.getOpenPositions();
   const alreadyHolding = (openPositions || []).some(
-    (p) => p.asset_class === "us_option" && positionBelongsTo(p, symbol)
+    (p) => p.asset_class === "us_option" && positionBelongsTo(p, instrument.tradeSymbol)
   );
   if (alreadyHolding) {
-    return { action: "skip", reason: `Already holding an open ${symbol} option position — not stacking a second one.` };
+    return { action: "skip", reason: `Already holding an open ${instrument.tradeSymbol} option position — not stacking a second one.` };
   }
 
-  const bars = await alpacaClient.getBars(symbol, { timeframe: "15Min", limit: 100 });
-  if (!bars.length) {
-    return { action: "skip", reason: "No bars returned (market closed with no recent data, or feed issue)." };
-  }
-
-  const analysis = findLatestSignal(bars, { lookback: SIGNAL_LOOKBACK_BARS });
   if (!analysis.signal) {
     return { action: "no-signal", reason: analysis.reason, trend: analysis.trend };
   }
 
-  // SMT/ICT Version gate: a raw BOS/CHoCH (what the Options Version traded
-  // on directly) is not enough here -- see smc.js's findLatestSignal for the
-  // full reasoning. Skipping an unconfirmed signal is deliberate, not a
-  // missed opportunity: this filter's entire premise is that most raw
-  // structure breaks are noise, and the ones worth taking are the minority
-  // with a real order block + liquidity sweep behind them.
+  // SMT/ICT Version gate — identical rule to the stock engine's: a raw
+  // BOS/CHoCH alone isn't enough, it also needs an order block + a recent
+  // liquidity sweep behind it (see smc.js's findLatestSignal). Both index
+  // instruments share this one gate since they share the one signal.
   if (!analysis.signal.confirmed) {
     return {
       action: "no-signal",
@@ -242,100 +148,69 @@ async function evaluateAndMaybeEnter(symbol) {
     };
   }
 
-  const spot = bars[bars.length - 1].c;
+  // SPY's spot scaled by this instrument's multiplier approximates ITS OWN
+  // index level -- 1x for XSP (no scaling), 10x for full SPX.
+  const scaledSpot = proxySpot * instrument.proxyMultiplier;
   const direction = analysis.signal.direction; // "call" | "put"
 
-  const { contract, reason: selectReason } = await alpacaClient.selectAtmContract(symbol, spot, direction, { minDaysOut: MIN_DAYS_OUT });
+  const { contract, reason: selectReason } = await alpacaClient.selectAtmContract(instrument.tradeSymbol, scaledSpot, direction, { minDaysOut: MIN_DAYS_OUT });
   if (!contract) {
     return { action: "skip", reason: selectReason, signal: analysis.signal };
   }
 
-  const threshold = liquidityThresholdFor(symbol);
-  if (contract.volume < threshold.minVolume || contract.openInterest < threshold.minOpenInterest) {
+  if (contract.volume < instrument.liquidityThreshold.minVolume || contract.openInterest < instrument.liquidityThreshold.minOpenInterest) {
     return {
       action: "skip",
-      reason: `${contract.symbol} is too thin to trade (volume ${contract.volume}, open interest ${contract.openInterest} — needs at least ${threshold.minVolume}/${threshold.minOpenInterest}), skipping even though the signal and strike look valid.`,
+      reason: `${contract.symbol} is too thin to trade (volume ${contract.volume}, open interest ${contract.openInterest} — needs at least ${instrument.liquidityThreshold.minVolume}/${instrument.liquidityThreshold.minOpenInterest}), skipping even though the signal and strike look valid.`,
       signal: analysis.signal,
       contract,
     };
   }
 
   const contractCost = contract.ask * 100;
-  if (contractCost > MAX_CONTRACT_COST) {
+  if (contractCost > instrument.maxContractCost) {
     return {
       action: "skip",
-      reason: `${contract.symbol} costs $${contractCost.toFixed(2)} per contract — above the $${MAX_CONTRACT_COST} cap, skipping even though the signal looks valid.`,
-      signal: analysis.signal,
-      contract,
-    };
-  }
-
-  const entryCostWithFee = +(contractCost + ENTRY_FEE).toFixed(2);
-
-  // Simulated-wallet check (see SIMULATED_WALLET_SIZE's comment above) --
-  // reuses the SAME openPositions fetched at the top of this function, so
-  // this costs no extra Alpaca call. This is the bot's own self-imposed
-  // limit, separate from and in addition to the real Alpaca paper account's
-  // actual (much larger) buying power, which would happily fill this order
-  // regardless.
-  const committed = totalCommittedCapital(openPositions);
-  const projectedTotal = +(committed + entryCostWithFee).toFixed(2);
-  if (projectedTotal > SIMULATED_WALLET_SIZE) {
-    return {
-      action: "skip",
-      reason: `${contract.symbol} would cost $${entryCostWithFee} on top of $${committed.toFixed(2)} already committed to other open positions ($${projectedTotal} total) — over the simulated $${SIMULATED_WALLET_SIZE} wallet cap used to size-check this bot as if it were already trading a $${SIMULATED_WALLET_SIZE} live account. Skipping even though the signal looks valid.`,
+      reason: `${contract.symbol} costs $${contractCost.toFixed(2)} per contract — above the $${instrument.maxContractCost} cap, skipping even though the signal looks valid.`,
       signal: analysis.signal,
       contract,
     };
   }
 
   const order = await alpacaClient.placeOrder({ symbol: contract.symbol, qty: CONTRACTS_PER_TRADE, side: "buy", type: "market", time_in_force: "day" });
+  const entryCostWithFee = +(contractCost + ENTRY_FEE).toFixed(2);
 
-  await notify(
-    `Entered ${symbol} ${direction.toUpperCase()}`,
-    `Bought ${CONTRACTS_PER_TRADE}x ${contract.symbol} @ $${contract.ask} — cost incl. $${ENTRY_FEE} fee: $${entryCostWithFee}.`
+  await stockEngine.notify(
+    `Entered ${instrument.tradeSymbol} ${direction.toUpperCase()}`,
+    `Bought ${CONTRACTS_PER_TRADE}x ${contract.symbol} @ $${contract.ask} (SPY proxy spot $${proxySpot}, scaled x${instrument.proxyMultiplier}) — cost incl. $${ENTRY_FEE} fee: $${entryCostWithFee}.`
   );
 
   return {
     action: "entered",
-    symbol,
+    symbol: instrument.tradeSymbol,
+    proxySymbol: PROXY_SYMBOL,
+    proxySpot,
     direction,
     contract,
     order,
     entryCostRaw: +contractCost.toFixed(2),
     entryCostWithFee,
     signal: analysis.signal,
-    reason: `${analysis.reason} Bought ${CONTRACTS_PER_TRADE}x ${contract.symbol} @ $${contract.ask} (cost incl. $${ENTRY_FEE} fee: $${entryCostWithFee}).`,
+    reason: `${analysis.reason} (via ${PROXY_SYMBOL} proxy x${instrument.proxyMultiplier}) Bought ${CONTRACTS_PER_TRADE}x ${contract.symbol} @ $${contract.ask} (cost incl. $${ENTRY_FEE} fee: $${entryCostWithFee}).`,
   };
 }
 
-// Pure READ-ONLY computation of where a position stands right now: current
-// net-if-sold, its stop-loss line, and a freshly recomputed take-profit
-// line. No side effects — safe to call from the dashboard on every page
-// load without risking an accidental close. evaluateAndMaybeExit (below)
-// is the only place allowed to actually act on these numbers.
-// Given how much profit a trade has reached (its HIGHEST point, not just
-// right now), works out where the trailing stop should sit. Three tiers
-// (see initialLadder in blackScholes.js for the full rationale) — this is
-// the paper-bot's OWN ladder, separate from the manual tool's:
-//   - below breakevenTriggerPct (25%) peak profit: the fixed 45%-loss line.
-//   - from 25% up to profitTriggerPct (40%) peak profit: breakeven (entry
-//     cost) — a real winner can no longer turn into a net loss, but no
-//     profit is locked in yet either.
-//   - at 40%+ peak profit: lockAtProfitTriggerPct (10%) of profit locks in
-//     immediately, then ratchets up another trailStepPct (10%) for every
-//     additional 10 points of peak profit — never moves back down.
-// Pure function, easy to reason about and unit-test on its own.
-function trailingStopLevel(entryCostWithFee, peakNet, ladder) {
-  const peakGainPct = ((peakNet - entryCostWithFee) / entryCostWithFee) * 100;
-  if (peakGainPct < ladder.breakevenTriggerPct) return ladder.initialSLPremium;
-  if (peakGainPct < ladder.profitTriggerPct) return +entryCostWithFee.toFixed(2);
-  const stepsPast = Math.floor((peakGainPct - ladder.profitTriggerPct) / ladder.trailStepPct);
-  const lockedPct = ladder.lockAtProfitTriggerPct + stepsPast * ladder.trailStepPct;
-  return +(entryCostWithFee * (1 + lockedPct / 100)).toFixed(2);
-}
-
-async function computeLiveLevels(position) {
+// ---- LIVE LEVELS / EXIT -----------------------------------------------------
+// Same shape as tradeEngine.computeLiveLevels, but fetches the underlying's
+// bars from PROXY_SYMBOL instead of the position's own root — parsed.root
+// here is "XSP"/"SPX", which Alpaca's bars endpoint can't serve (see file
+// header). SMT/ICT Version fix: the peak is now tracked from REAL observed
+// values via peakStore.js, same as the stock engine — this REPLACES the
+// old Black-Scholes/IV backward-reconstruction loop this file used to have,
+// which had the exact same "reconstructed peak swings wildly with whatever
+// IV happens to be quoted" problem already found and fixed on the stock
+// side (see peakStore.js's own header comment for the full story).
+async function computeLiveLevels(position, instrument) {
   const parsed = alpacaClient.parseOccSymbol(position.symbol);
   if (!parsed) return { error: `Could not parse option symbol ${position.symbol}.` };
 
@@ -348,34 +223,24 @@ async function computeLiveLevels(position) {
   const netIfSoldNow = quote.bid * 100 - EXIT_FEE;
   const T = yearsUntil(parsed.expirationDate);
 
-  const bars = await alpacaClient.getBars(parsed.root, { timeframe: "15Min", limit: 300 });
+  const bars = await alpacaClient.getBars(PROXY_SYMBOL, { timeframe: "15Min", limit: 300 });
 
-  // This target level is a SEPARATE, purely informational reference number
-  // (shown on the dashboard as "where structure suggests price could go")
-  // -- it has nothing to do with the trailing-stop peak below, and still
-  // needs bars/IV for its own one-off Black-Scholes projection.
+  // Reference-only target level -- unrelated to the trailing-stop peak
+  // below, still needs the proxy's bars/IV for its own one-off projection.
   let targetTotal = null, targetUnderlyingPrice = null;
   if (bars.length) {
-    const spot = bars[bars.length - 1].c;
-    const iv = quote.impliedVolatility || impliedVolatility(quote.ask ?? quote.bid, spot, parsed.strike, T, RISK_FREE_RATE, parsed.type) || 0.5;
-    const swings = findSwings(bars, 2);
-    const target = nearestTarget(swings, parsed.type, spot);
-    if (target) {
-      const projected = blackScholes(target.price, parsed.strike, T, RISK_FREE_RATE, iv, parsed.type);
-      targetTotal = +(projected.price * 100 - EXIT_FEE).toFixed(2);
-      targetUnderlyingPrice = target.price;
-    }
+    const scaledSpot = bars[bars.length - 1].c * instrument.proxyMultiplier;
+    const iv = quote.impliedVolatility || impliedVolatility(quote.ask ?? quote.bid, scaledSpot, parsed.strike, T, RISK_FREE_RATE, parsed.type) || 0.5;
+    // Swing-based target projection intentionally omitted here (unlike the
+    // stock engine) -- it would need the SAME swings/target logic re-run
+    // per instrument for no real informational gain over the stock
+    // dashboard's own reference number, and this field is display-only.
+    void iv; void targetUnderlyingPrice;
   }
 
-  // The trailing-stop peak is now tracked from REAL observed values only --
-  // see peakStore.js for the full rationale. This replaced a Black-Scholes/
-  // IV backward reconstruction that could badly misstate the past (proven
-  // concretely: the exact same underlying price path produced peaks
-  // anywhere from $642 to $1,117 depending only on which IV was assumed).
-  // Every time this function runs (every ~5 min via the cycle), it already
-  // has a REAL, non-approximated live bid -- so instead of guessing
-  // backward, we just remember the highest real value ever actually seen
-  // for this exact contract and use that as the peak.
+  // Real-observed-peak tracking (see peakStore.js) -- no IV assumption, no
+  // backward guessing, just remembers the highest REAL value ever actually
+  // seen for this exact contract.
   const peakNet = peakStore.recordAndGetPeak(position.symbol, netIfSoldNow);
 
   return {
@@ -384,207 +249,100 @@ async function computeLiveLevels(position) {
     entryCostWithFee: +entryCostWithFee.toFixed(2),
     netIfSoldNow: +netIfSoldNow.toFixed(2),
     peakNet: +peakNet.toFixed(2),
-    trailStop: trailingStopLevel(entryCostWithFee, peakNet, ladder),
-    targetLevel: targetTotal, // informational only — no longer a forced exit trigger
+    trailStop: stockEngine.trailingStopLevel(entryCostWithFee, peakNet, ladder),
+    targetLevel: targetTotal,
     targetUnderlyingPrice,
     pnlIfSoldNow: +(netIfSoldNow - entryCostWithFee).toFixed(2),
   };
 }
 
-// ---- EXIT -------------------------------------------------------------------
-// Exit is the trailing stop PLUS a fixed take-profit door (see
-// TAKE_PROFIT_PCT's comment above for the backtest evidence behind adding
-// this back). Below +40% peak profit, the stop is just the initial
-// 45%-loss line; above it, the stop ratchets up in 20% steps and never
-// gives back more than one step's worth of profit. Whichever of the two
-// exit conditions is reached first wins -- same "first condition in bar
-// order" rule backtestSymbol already used for this A/B lever, so live
-// behavior now matches exactly what was backtested. targetLevel is still
-// shown on the dashboard as a reference (where structure suggests price
-// could go), but it still never triggers a close on its own.
-async function evaluateAndMaybeExit(position) {
-  const levels = await computeLiveLevels(position);
+async function evaluateAndMaybeExit(position, instrument) {
+  const levels = await computeLiveLevels(position, instrument);
   if (levels.error) return { action: "hold", reason: levels.error };
 
-  const { parsed, netIfSoldNow, trailStop, peakNet, targetLevel, entryCostWithFee } = levels;
-  const fixedTP = TAKE_PROFIT_PCT != null ? +(entryCostWithFee * (1 + TAKE_PROFIT_PCT / 100)).toFixed(2) : null;
-  const hitFixedTP = fixedTP != null && netIfSoldNow >= fixedTP;
+  const { parsed, netIfSoldNow, trailStop, peakNet, targetLevel } = levels;
 
-  if (hitFixedTP || netIfSoldNow <= trailStop) {
+  if (netIfSoldNow <= trailStop) {
     const closeOrder = await alpacaClient.closePosition(position.symbol);
-    // Position is done -- drop its remembered peak so nothing stale lingers
-    // (see peakStore.clearPeak's comment for why this matters, however
-    // unlikely). pruneToSymbols (in runCycle) would eventually catch this
-    // too, but clearing it immediately is free and more precise.
+    // Done with this position -- drop its remembered peak (see
+    // peakStore.clearPeak's comment for why, however unlikely to matter).
     peakStore.clearPeak(position.symbol);
-    const exitReason = hitFixedTP
-      ? "take-profit"
-      : (trailStop > levels.entryCostWithFee ? "trailing-stop (locked in profit)" : "stop-loss");
-    const thresholdHit = hitFixedTP ? fixedTP : trailStop;
-    await notify(
+    const exitReason = trailStop > levels.entryCostWithFee ? "trailing-stop (locked in profit)" : "stop-loss";
+    await stockEngine.notify(
       `Closed: ${parsed.root}`,
-      `Closed ${position.symbol} — net proceeds $${netIfSoldNow} ${hitFixedTP ? ">=" : "<="} ${hitFixedTP ? "take-profit" : "stop"} $${thresholdHit} (peak was $${peakNet}).`
+      `Closed ${position.symbol} — net proceeds $${netIfSoldNow} <= stop $${trailStop} (peak was $${peakNet}).`
     );
     return {
       action: "exited", exitReason, symbol: parsed.root,
-      netProceeds: netIfSoldNow, trailStop, fixedTP, peakNet, closeOrder,
-      reason: `${exitReason} hit: net proceeds $${netIfSoldNow} vs stop $${trailStop}${fixedTP != null ? ` / take-profit $${fixedTP}` : ""} (peak reached $${peakNet}). Closed ${position.symbol}.`,
+      netProceeds: netIfSoldNow, trailStop, peakNet, closeOrder,
+      reason: `${exitReason} hit: net proceeds $${netIfSoldNow} <= stop $${trailStop} (peak reached $${peakNet}). Closed ${position.symbol}.`,
     };
   }
 
   return {
-    action: "hold", symbol: parsed.root, netIfSoldNow, trailStop, fixedTP, peakNet, targetLevel,
-    reason: `Holding ${position.symbol}: net now $${netIfSoldNow}, trailing stop $${trailStop}${fixedTP != null ? `, take-profit $${fixedTP}` : ""} (peak $${peakNet}), reference target ${targetLevel != null ? "$" + targetLevel : "n/a yet"}.`,
+    action: "hold", symbol: parsed.root, netIfSoldNow, trailStop, peakNet, targetLevel,
+    reason: `Holding ${position.symbol}: net now $${netIfSoldNow}, trailing stop $${trailStop} (peak $${peakNet}), reference target ${targetLevel != null ? "$" + targetLevel : "n/a yet"}.`,
   };
 }
 
-// Caps a closed trade's displayed exit at the ladder's BASE 45%-loss floor
-// (55% of entry cost) when the real fill landed worse than that -- e.g. a
-// $100 entry with a $55 stop that actually filled at $40 due to check-
-// cadence slippage (the bot only checks every 5 min -- see
-// paper-bot-cycle.yml -- so price can keep falling past the stop before the
-// next check actually closes it) now displays as having closed at $55.
-//
-// This is intentionally narrow and DETERMINISTIC, not an approximation:
-// the base floor is the lowest a stop can ever be -- it only ever ratchets
-// UP once a trade's peak profit clears the breakeven trigger (25%). So if
-// the REAL fill already shows a loss deeper than that floor, that is
-// mathematical proof the position's peak profit never got that high at any
-// point -- the stop was the base floor for the position's entire life, no
-// exceptions, no guessing required.
-//
-// An earlier version of this tried to reconstruct the intended exit for
-// EVERY tier (including breakeven and locked-in-profit closes) by replaying
-// historical underlying bars through Black-Scholes with an implied vol
-// backed out once at entry and held constant. That's a reasonable
-// approximation for a small move, but for a real, large winning trade it
-// drifted far enough from reality to report a deeply profitable trade as
-// an exact $0.00 breakeven -- a wrong number PERMANENTLY overwriting a real
-// one, with no live refresh (unlike the open-positions dashboard) to ever
-// self-correct. Given that failure mode, this is now scoped to ONLY the
-// case above where no such approximation is needed at all. Every other
-// closed trade (breakeven-tier or real locked-in profit) shows its actual,
-// real fill, unmodified.
-//
-// IMPORTANT: this ONLY changes what the /trades dashboard displays. The
-// actual Alpaca paper account, its order history, and its real fill price
-// are completely untouched -- this is a reporting-only adjustment.
-function reconstructIntendedExit({ entryCostWithFee, actualExitProceeds }) {
-  const ladder = initialLadder(entryCostWithFee);
-  const baseFloor = ladder.initialSLPremium;
-  if (actualExitProceeds < baseFloor) {
-    return { exitProceedsWithFee: baseFloor, reconstructed: true };
-  }
-  return { exitProceedsWithFee: actualExitProceeds, reconstructed: false };
-}
-
 // ---- CLOSED TRADE HISTORY ---------------------------------------------------
-// Reconstructs round-trip trades from Alpaca's own order history — no local
-// storage needed. Pairs each filled BUY with the next filled SELL for the
-// same option symbol (safe because this engine only ever holds one position
-// per underlying at a time and always closes fully before re-entering).
-//
-// `symbols` scopes this to just this engine's own underlyings. This matters
-// once more than one bot shares the same Alpaca paper account (this stock
-// engine AND the separate XSP engine both trade out of one account) — Alpaca's
-// order history has no concept of "which bot," so without a filter the stock
-// dashboard would start showing XSP trades mixed in, and vice versa, the
-// moment both have real closed trades. Defaults to this module's own
-// SYMBOLS so existing callers (the stock /trades route) keep working exactly
-// as before with no changes needed on their end.
-async function getClosedTrades({ limit = 10, symbols = SYMBOLS } = {}) {
-  const orders = await alpacaClient.getOrders({ status: "closed", limit: 200 });
-  const allowedRoots = new Set(symbols.map((s) => String(s).trim().toUpperCase()));
-  const filled = (orders || []).filter((o) => {
-    if (o.status !== "filled" || o.asset_class !== "us_option") return false;
-    const parsed = alpacaClient.parseOccSymbol(o.symbol);
-    return parsed && allowedRoots.has(parsed.root);
-  });
-  const bySymbol = {};
-  for (const o of filled) {
-    (bySymbol[o.symbol] = bySymbol[o.symbol] || []).push(o);
-  }
-  const pairs = [];
-  for (const symbol of Object.keys(bySymbol)) {
-    const ordersForSymbol = bySymbol[symbol].sort((a, b) => new Date(a.filled_at) - new Date(b.filled_at));
-    for (let i = 0; i < ordersForSymbol.length - 1; i++) {
-      if (ordersForSymbol[i].side === "buy" && ordersForSymbol[i + 1].side === "sell") {
-        pairs.push({ symbol, buy: ordersForSymbol[i], sell: ordersForSymbol[i + 1] });
-        i++; // consume the pair
-      }
-    }
-  }
-  // Sort newest-first and trim to `limit` before building the final trade
-  // objects below -- no point doing the extra work for trades that won't
-  // even be shown.
-  pairs.sort((a, b) => new Date(b.sell.filled_at) - new Date(a.sell.filled_at));
-  const trimmed = pairs.slice(0, limit);
-
-  const trades = [];
-  for (const { symbol, buy, sell } of trimmed) {
-    const parsed = alpacaClient.parseOccSymbol(symbol);
-    const entryCostWithFee = +(parseFloat(buy.filled_avg_price) * 100 + ENTRY_FEE).toFixed(2);
-    const actualExitProceeds = +(parseFloat(sell.filled_avg_price) * 100 - EXIT_FEE).toFixed(2);
-
-    // Caps display at the base 45%-loss floor when the real fill breached
-    // it -- see reconstructIntendedExit's comment above for exactly why
-    // this is safe/deterministic and scoped the way it is.
-    const { exitProceedsWithFee } = reconstructIntendedExit({ entryCostWithFee, actualExitProceeds });
-
-    trades.push({
-      symbol: parsed ? parsed.root : symbol,
-      optionSymbol: symbol,
-      direction: parsed ? parsed.type : null,
-      entryCostWithFee,
-      exitProceedsWithFee,
-      pnl: +(exitProceedsWithFee - entryCostWithFee).toFixed(2),
-      enteredAt: buy.filled_at,
-      exitedAt: sell.filled_at,
-    });
-  }
-  return trades;
+// Delegates to the stock engine's own implementation (identical pairing
+// logic, no need to duplicate it) but scoped to ONLY this engine's own
+// instruments (XSP + SPX) — otherwise this would pull in the stock bot's
+// trades too, since both share one Alpaca paper account and Alpaca's order
+// history has no per-bot concept.
+async function getClosedTrades({ limit = 10 } = {}) {
+  return stockEngine.getClosedTrades({ limit, symbols: INSTRUMENTS.map((i) => i.tradeSymbol) });
 }
 
 // ---- CYCLE ------------------------------------------------------------------
-async function runCycle(symbols = SYMBOLS) {
+// One SPY bar fetch + one signal computation per cycle, shared by every
+// instrument in INSTRUMENTS -- each instrument still independently checks
+// its own open-position state, cost cap, and liquidity bar.
+async function runCycle() {
   const openPositions = (await alpacaClient.getOpenPositions()).filter((p) => p.asset_class === "us_option");
-  // Keep peakStore.js's persisted file from growing forever -- drop any
-  // remembered peak for a contract that isn't actually open anymore. Most
-  // closes already clear their own entry immediately (see
-  // evaluateAndMaybeExit), so this is mainly a safety net for anything
-  // closed some other way (e.g. manually, or a crash mid-close).
+  // Keep peakStore's persisted file from growing forever -- see
+  // tradeEngine.js's runCycle for the same pattern on the stock side.
   peakStore.pruneToSymbols(openPositions.map((p) => p.symbol));
+
+  const bars = await alpacaClient.getBars(PROXY_SYMBOL, { timeframe: "15Min", limit: 100 });
   const results = {};
-  for (const symbol of symbols) {
+
+  if (!bars.length) {
+    for (const instrument of INSTRUMENTS) {
+      results[instrument.tradeSymbol] = { action: "skip", reason: `No bars returned for proxy ${PROXY_SYMBOL} (market closed with no recent data, or feed issue).` };
+    }
+    return { ranAt: new Date().toISOString(), results };
+  }
+
+  const analysis = findLatestSignal(bars, { lookback: SIGNAL_LOOKBACK_BARS });
+  const proxySpot = bars[bars.length - 1].c;
+
+  for (const instrument of INSTRUMENTS) {
     try {
-      const existing = openPositions.find((p) => positionBelongsTo(p, symbol));
-      results[symbol] = existing ? await evaluateAndMaybeExit(existing) : await evaluateAndMaybeEnter(symbol);
+      const existing = openPositions.find((p) => positionBelongsTo(p, instrument.tradeSymbol));
+      results[instrument.tradeSymbol] = existing
+        ? await evaluateAndMaybeExit(existing, instrument)
+        : await evaluateAndMaybeEnter(instrument, analysis, proxySpot);
     } catch (err) {
-      results[symbol] = { action: "error", reason: err.message };
+      results[instrument.tradeSymbol] = { action: "error", reason: err.message };
     }
   }
   return { ranAt: new Date().toISOString(), results };
 }
 
 module.exports = {
-  SYMBOLS,
+  PROXY_SYMBOL,
+  INSTRUMENTS,
   ENTRY_FEE,
   EXIT_FEE,
-  MAX_CONTRACT_COST,
   MIN_DAYS_OUT,
   RISK_FREE_RATE,
   CONTRACTS_PER_TRADE,
   SIGNAL_LOOKBACK_BARS,
-  SIMULATED_WALLET_SIZE,
-  TAKE_PROFIT_PCT,
-  liquidityThresholdFor,
   yearsUntil,
   positionBelongsTo,
-  totalCommittedCapital,
-  trailingStopLevel,
-  notify,
   computeLiveLevels,
-  reconstructIntendedExit,
   evaluateAndMaybeEnter,
   evaluateAndMaybeExit,
   getClosedTrades,
