@@ -1,38 +1,42 @@
-// A SEPARATE decision engine for trading INDEX options — XSP (Mini-SPX) and
-// SPX (full-size SPX) — entirely independent of tradeEngine.js's stock
-// watchlist, mirroring how the whole paper-bot track is kept separate from
-// the original manual tool. Shares only pure library code (smc.js,
-// blackScholes.js, alpacaClient.js, peakStore.js) plus two small pieces of
-// tradeEngine.js (notify, trailingStopLevel, getClosedTrades) that are
-// genuinely identical math/plumbing, not index-specific — reusing them
-// instead of copy-pasting keeps the ratchet logic and notification
-// behavior from silently drifting between engines.
+// A SEPARATE decision engine for trading the INDEX option XSP (Mini-SPX) —
+// entirely independent of tradeEngine.js's stock watchlist, mirroring how
+// the whole paper-bot track is kept separate from the original manual tool.
+// Shares only pure library code (smc.js, blackScholes.js, alpacaClient.js,
+// peakStore.js) plus two small pieces of tradeEngine.js (notify,
+// trailingStopLevel, getClosedTrades) that are genuinely identical
+// math/plumbing, not index-specific — reusing them instead of copy-pasting
+// keeps the ratchet logic and notification behavior from silently drifting
+// between engines.
 //
-// WHY THIS ISN'T AS SIMPLE AS "run the stock engine on symbol XSP/SPX":
-// Alpaca can trade both (they're on Alpaca's supported index-options list),
+// SPX REMOVED 2026-09-23, at the user's request, after confirming a real
+// structural problem, not just a tuning issue: Alpaca does not list SPX's
+// near-term (weekly/daily/0DTE) contracts under the plain root "SPX" --
+// live selectAtmContract() calls for SPX kept resolving to a MONTHLY
+// contract 3+ weeks out (e.g. expiring 2026-10-16 when run on 2026-09-23),
+// never anything near-dated, no matter what MIN_DAYS_OUT was set to. This
+// was flagged as an explicit unverified assumption when this file was
+// first written (some brokers list SPX weeklies under a separate root,
+// "SPXW", instead) and live behavior confirmed it. Rather than guess at
+// "SPXW" without being able to verify it against a real options chain,
+// the user chose to drop SPX from live trading entirely and run XSP alone,
+// since XSP's contracts (also checked live) resolve correctly, including
+// to same-day (0DTE) expirations. There were zero open SPX positions at
+// removal time, so nothing needed to be unwound.
+//
+// WHY THIS ISN'T AS SIMPLE AS "run the stock engine on symbol XSP":
+// Alpaca can trade it (XSP is on Alpaca's supported index-options list),
 // but as of this writing Alpaca does NOT provide market data (bars/quotes)
-// for either index directly — their own docs say index data is "coming
-// months" away. Both are INDEX options, not ETFs, so there's no tradable
+// for the index directly — their own docs say index data is "coming
+// months" away. It's an INDEX option, not an ETF, so there's no tradable
 // underlying to pull bars for directly.
 //
 // The fix: XSP's index level is designed to track 1/10th of SPX — and so is
 // SPY (the ETF). That means SPY's own price, which Alpaca fully supports,
-// is an excellent live proxy for XSP's level with NO conversion needed. For
-// full SPX, the same SPY price needs multiplying by 10 (SPX ≈ SPY × 10) —
-// see `proxyMultiplier` on each instrument below. Signal detection
-// (trend/BOS/CHoCH/order-block/liquidity-sweep) runs ONCE per cycle on
-// SPY's real bars and is shared by both instruments (they're both just
-// scaled views of the same underlying index move) — only strike selection
-// and Black-Scholes pricing apply each instrument's own multiplier. Nothing
-// about SPY itself is ever bought or held — it's a read-only price proxy.
-//
-// UNVERIFIED ASSUMPTION (flagged, not silently assumed): this file assumes
-// Alpaca's paper environment accepts "SPX" as an options underlying_symbol
-// the same way it already does for "XSP". That has NOT been confirmed live
-// (this sandbox has no Alpaca credentials to check) — some brokers only
-// expose SPX weeklies under a different root ("SPXW"). If SPX contracts
-// come back empty every cycle once this is live, that's the first thing to
-// check via Alpaca's own options-contracts endpoint/docs.
+// is an excellent live proxy for XSP's level with NO conversion needed —
+// see `proxyMultiplier` on the instrument below (kept as a per-instrument
+// field, a holdover from when SPX shared this same list, in case another
+// index-tracking instrument is ever added back). Nothing about SPY itself
+// is ever bought or held — it's a read-only price proxy.
 const alpacaClient = require("./alpacaClient");
 const { findLatestSignal } = require("./smc");
 const { blackScholes, impliedVolatility, initialLadder } = require("./blackScholes");
@@ -47,14 +51,15 @@ const ENTRY_FEE = 3;
 const EXIT_FEE = 3;
 // Changed 1 -> 0 on 2026-09-22 at the user's explicit request, after a
 // zeroDte backtest (see xsp-routes.js's /xsp-bot/backtest?zeroDte=true and
-// backtest.js) showed a positive-but-high-variance profile (XSP: 33.9% win
-// rate, SPX: 38.3% win rate, both net positive over a 90-day sample).
+// backtest.js) showed a positive-but-high-variance profile for XSP (33.9%
+// win rate, net positive over a 90-day sample; SPX was also tested there
+// before SPX was removed from live trading below).
 // selectAtmContract() (alpacaClient.js) uses this as `expirationDateGte`
 // against Alpaca's REAL listed contracts (not the backtest's synthetic
 // same-day approximation) -- so 0 here means "today's date or later,"
 // which only actually pulls in a same-day (0DTE) contract on days Alpaca
-// lists one for XSP/SPX (both list real daily expirations, unlike the
-// stock watchlist's Friday-only series).
+// lists one for XSP (confirmed live -- XSP lists real daily expirations,
+// unlike the stock watchlist's Friday-only series).
 //
 // KNOWN RISK, carried over unchanged from the stock engine's own MIN_DAYS_OUT
 // comment: this bot's run-cycle is only polled every 5 minutes (via
@@ -68,9 +73,10 @@ const RISK_FREE_RATE = 0.05;
 const CONTRACTS_PER_TRADE = 1;
 const SIGNAL_LOOKBACK_BARS = 3; // same freshness window as the stock engine
 
-// Each index instrument this engine trades. Both share the SAME signal
-// (derived from one SPY bar fetch per cycle) but have their OWN contract
-// cost cap, liquidity bar, and price-scaling multiplier against SPY.
+// The index instrument this engine trades. Kept as a single-element list
+// (rather than inlining these fields) so the rest of the file -- the
+// position loop, getClosedTrades' symbol filter, etc. -- doesn't need to
+// change shape if another index-tracking instrument is ever added back.
 const INSTRUMENTS = [
   {
     // "XSP" is the OCC root Alpaca uses for Mini-SPX index option contracts.
@@ -83,25 +89,14 @@ const INSTRUMENTS = [
     maxContractCost: 500,
     // XSP's WHOLE market trades roughly 50,000-150,000 contracts/day (Cboe)
     // — a deliberately separate, XSP-scaled liquidity tier, not reused from
-    // the stock engine's mega-cap tier or a naive "SPX" assumption.
+    // the stock engine's mega-cap tier or a naive "SPX" assumption. NOTE:
+    // live evidence on 2026-09-23 showed a fresh, valid same-day (0DTE)
+    // contract getting skipped at volume 50 / open interest 52 against this
+    // 300/1500 bar -- a brand-new 0DTE listing may not clear this threshold
+    // early in the day even when the signal is good. Left unchanged for now
+    // (not part of the SPX removal), but flagged as a likely next thing to
+    // revisit if XSP keeps skipping fresh 0DTE contracts on liquidity alone.
     liquidityThreshold: { minVolume: 300, minOpenInterest: 1500 },
-  },
-  {
-    // Full-size SPX. NOT the same contract as XSP -- 10x the notional, its
-    // own OCC root, its own order book.
-    tradeSymbol: "SPX",
-    proxyMultiplier: 10, // full SPX tracks SPY * 10, unlike XSP which needs no scaling.
-    // SPX ATM premium is roughly 10x XSP's (index ~6000, ATM premium
-    // ~$30-$40 * $100 multiplier ≈ $3000-$4000) -- $5000 leaves similar
-    // proportional headroom to XSP's own $500 cap. UNTUNED starting point,
-    // meant to be revisited once a real backtest/live sample exists.
-    maxContractCost: 5000,
-    // SPX is the single most-traded index option in the world (1.5M+
-    // contracts/day) -- these thresholds are set conservatively low
-    // relative to that real liquidity (so real SPX flow clears them
-    // easily) rather than tuned tight, since there's no historical
-    // options-volume data available to calibrate against precisely.
-    liquidityThreshold: { minVolume: 1000, minOpenInterest: 3000 },
   },
 ];
 
@@ -149,7 +144,8 @@ async function evaluateAndMaybeEnter(instrument, analysis, proxySpot) {
   }
 
   // SPY's spot scaled by this instrument's multiplier approximates ITS OWN
-  // index level -- 1x for XSP (no scaling), 10x for full SPX.
+  // index level -- 1x for XSP (no scaling; proxyMultiplier stays a
+  // per-instrument field as a holdover from when SPX shared this list).
   const scaledSpot = proxySpot * instrument.proxyMultiplier;
   const direction = analysis.signal.direction; // "call" | "put"
 
@@ -203,7 +199,7 @@ async function evaluateAndMaybeEnter(instrument, analysis, proxySpot) {
 // ---- LIVE LEVELS / EXIT -----------------------------------------------------
 // Same shape as tradeEngine.computeLiveLevels, but fetches the underlying's
 // bars from PROXY_SYMBOL instead of the position's own root — parsed.root
-// here is "XSP"/"SPX", which Alpaca's bars endpoint can't serve (see file
+// here is "XSP", which Alpaca's bars endpoint can't serve (see file
 // header). SMT/ICT Version fix: the peak is now tracked from REAL observed
 // values via peakStore.js, same as the stock engine — this REPLACES the
 // old Black-Scholes/IV backward-reconstruction loop this file used to have,
@@ -288,7 +284,7 @@ async function evaluateAndMaybeExit(position, instrument) {
 // ---- CLOSED TRADE HISTORY ---------------------------------------------------
 // Delegates to the stock engine's own implementation (identical pairing
 // logic, no need to duplicate it) but scoped to ONLY this engine's own
-// instruments (XSP + SPX) — otherwise this would pull in the stock bot's
+// instrument (XSP) — otherwise this would pull in the stock bot's
 // trades too, since both share one Alpaca paper account and Alpaca's order
 // history has no per-bot concept.
 async function getClosedTrades({ limit = 10 } = {}) {
