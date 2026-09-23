@@ -1,14 +1,21 @@
-// Index-options track (XSP + SPX) — a SEPARATE bot from the stock
+// Index-options track (XSP only) — a SEPARATE bot from the stock
 // watchlist, mounted under /xsp-bot/* in server.js. Shares the same Alpaca
 // paper account and the same underlying library code (smc.js,
 // blackScholes.js, alpacaClient.js, peakStore.js) as the stock bot, but its
 // own decision engine (xspTradeEngine.js) and its own routes here — see
 // that file's header comment for why these need a SPY price proxy.
 //
-// Route path kept as /xsp-bot/* even though SPX was added alongside XSP in
-// the SMT/ICT Version -- renaming it would mean touching server.js's
-// mount point and the GitHub Actions workflow that pings /xsp-bot/run-cycle,
-// for a cosmetic gain only.
+// SPX was removed from live trading on 2026-09-23 (see xspTradeEngine.js's
+// header for the full reason -- Alpaca wasn't listing near-term SPX
+// contracts under the plain root this code used). Nothing in this file
+// hardcodes SPX -- everything below already derives its instrument list
+// from xspEngine.INSTRUMENTS, so removing SPX there was enough to drop it
+// from every route here too (including /backtest, which now only runs
+// XSP; ?symbol=SPX returns the existing "unknown symbol" 400 below).
+//
+// Route path kept as /xsp-bot/* even though this used to also cover SPX --
+// renaming it would mean touching server.js's mount point and the GitHub
+// Actions workflow that pings /xsp-bot/run-cycle, for a cosmetic gain only.
 const express = require("express");
 const { getAccount, getOpenPositions, getBars, parseOccSymbol } = require("./alpacaClient");
 const { findLatestSignal } = require("./smc");
@@ -47,10 +54,8 @@ router.get("/health", async (req, res) => {
   }
 });
 
-// GET /xsp-bot/test-signals — sanity check on the shared SPY proxy signal
-// (not XSP/SPX themselves — see xspTradeEngine.js header for why). Both
-// instruments react to the SAME signal, just scaled/filtered differently,
-// so there's exactly one result here, not one per instrument.
+// GET /xsp-bot/test-signals — sanity check on the SPY proxy signal (not
+// XSP itself — see xspTradeEngine.js header for why).
 router.get("/test-signals", async (req, res) => {
   try {
     const bars = await getBars(xspEngine.PROXY_SYMBOL, { timeframe: "15Min", limit: 100 });
@@ -78,8 +83,7 @@ router.get("/test-signals", async (req, res) => {
 
 // GET /xsp-bot/run-cycle — the automation trigger for THIS bot, separate
 // from the stock bot's own /paper-bot/run-cycle. Something external has to
-// hit this periodically (see xsp-bot-cycle.yml). One call now evaluates
-// BOTH XSP and SPX (see xspTradeEngine.runCycle).
+// hit this periodically (see xsp-bot-cycle.yml).
 router.get("/run-cycle", async (req, res) => {
   try {
     const result = await xspEngine.runCycle();
@@ -91,21 +95,20 @@ router.get("/run-cycle", async (req, res) => {
 
 // GET /xsp-bot/backtest — same walk-forward approach as the stock bot's
 // backtest, run on SPY's historical bars (the same proxy used live).
-// ?symbol=XSP|SPX picks which instrument's cost cap/multiplier to backtest
-// with; omit it to get both, run back-to-back off the SAME fetched bars
-// (one Alpaca history call either way). The liquidity filter still can't
-// be replayed historically (no historical options volume/OI data exists)
-// — same limitation as the stock backtest, see backtest.js's top comment.
+// ?symbol=XSP is the only valid value now that SPX has been removed from
+// xspEngine.INSTRUMENTS (see xspTradeEngine.js header); omit it to get the
+// same single-instrument result. ?symbol=SPX (or anything else unknown)
+// hits the 400 below rather than silently running nothing. The liquidity
+// filter still can't be replayed historically (no historical options
+// volume/OI data exists) — same limitation as the stock backtest, see
+// backtest.js's top comment.
 //
-// ?zeroDte=true — curiosity/comparison lever, NOT the live engine's
-// behavior and NOT the default. Every entry targets an expiration on the
-// SAME calendar day instead of the next-Friday approximation, i.e. what a
-// 0DTE SPX/SPXW strategy would have done on these same historical bars.
-// The live engine deliberately never does this (MIN_DAYS_OUT = 1 excludes
-// same-day-expiration contracts entirely) — see xspTradeEngine.js's own
-// comment on MIN_DAYS_OUT for why. This flag exists purely to let that
-// choice be checked against real numbers on request, not to suggest 0DTE
-// is being considered for the live bot.
+// ?zeroDte=true — curiosity/comparison lever, NOT the default, but IS
+// consistent with the live engine now: MIN_DAYS_OUT = 0 in xspTradeEngine.js
+// means the live bot DOES trade same-day (0DTE) XSP contracts when Alpaca
+// lists one (see that file's own comment on MIN_DAYS_OUT). This flag lets
+// that same same-day-expiration behavior be checked against a longer
+// historical window than a single live day can show.
 router.get("/backtest", async (req, res) => {
   try {
     const daysBack = req.query.daysBack ? parseInt(req.query.daysBack, 10) : 90;
@@ -167,13 +170,12 @@ router.get("/backtest", async (req, res) => {
       zeroDte,
       results: byInstrument,
       caveats: [
-        "Signal detection runs on SPY's real historical bars (a proxy for XSP/SPX's own level, since Alpaca doesn't provide historical index data) — not either index's own price history directly.",
+        "Signal detection runs on SPY's real historical bars (a proxy for XSP's own level, since Alpaca doesn't provide historical index data) — not XSP's own price history directly.",
         "Options pricing is APPROXIMATED (Black-Scholes with volatility estimated from SPY's own recent realized moves) — Alpaca has no deep historical options quote data to replay exactly.",
-        "SPX figures scale SPY's close by x10 (proxyMultiplier) for strike/pricing purposes only — this has NOT been cross-checked against SPX's own real historical prices, which can diverge slightly from a pure x10 relationship intraday.",
         zeroDte
-          ? "zeroDte=true: expiration = SAME DAY as entry (approximating a 0DTE SPX/SPXW strategy), NOT the next-Friday approximation the live engine actually uses -- MIN_DAYS_OUT=1 in xspTradeEngine.js deliberately excludes same-day-expiration contracts live, so these results describe a strategy this bot does NOT run, for comparison only."
-          : "Strike = nearest whole dollar to the scaled proxy spot at entry; expiration = next Friday at least 1 day out.",
-        "The live liquidity filter (skip thin volume/open-interest contracts) and the SMT/ICT order-block + liquidity-sweep confirmation gate could not both be replayed exactly as the live bot applies them -- findLatestSignal's confirmed flag IS evaluated per bar here (same function, same rule), but there is no historical options volume/OI to check the liquidity filter against.",
+          ? "zeroDte=true: expiration = SAME DAY as entry -- this now MATCHES the live engine's actual behavior (MIN_DAYS_OUT=0 in xspTradeEngine.js), so this is a look at the same same-day-expiration strategy the live bot runs, over a longer historical window than a single live day can show."
+          : "Strike = nearest whole dollar to the scaled proxy spot at entry; expiration = next Friday at least 1 day out (this is NOT what the live engine does anymore -- pass zeroDte=true to match live behavior).",
+        "The live liquidity filter (skip thin volume/open-interest contracts) and the SMT/ICT order-block + liquidity-sweep confirmation gate could not both be replayed exactly as the live bot applies them -- findLatestSignal's confirmed flag IS evaluated per bar here (same function, same rule), but there is no historical options volume/OI to check the liquidity filter against. This matters more than it used to: live evidence on 2026-09-23 showed a real, valid 0DTE XSP signal getting skipped for exactly this reason (fresh contract, volume/OI below threshold), which this backtest cannot reproduce or warn about.",
       ],
     });
   } catch (err) {
@@ -208,7 +210,7 @@ function pctSpan(entry, pnl) {
 // to-today design as the stock bot's /paper-bot/trades (see
 // paper-bot-routes.js, which this block deliberately mirrors line-for-line
 // where the logic is identical — only the data source and the mount path
-// differ), scoped to XSP + SPX positions/orders (see
+// differ), scoped to XSP positions/orders (see
 // xspTradeEngine.getClosedTrades for why the scoping matters).
 router.get("/trades", async (req, res) => {
   try {
@@ -336,7 +338,7 @@ router.get("/trades", async (req, res) => {
 
     res.set("Content-Type", "text/html").send(`<!doctype html>
 <html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60;url=${refreshUrl}">
-<title>Index-bot trades (XSP/SPX)</title>
+<title>Index-bot trades (XSP)</title>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0f14; color:#e6e9ee; margin:0; padding:24px; }
   h1 { font-size:18px; font-weight:600; margin:0 0 4px; }
@@ -358,7 +360,7 @@ router.get("/trades", async (req, res) => {
 </style></head>
 <body>
   <h1>Index-bot trades</h1>
-  <p class="sub">XSP + SPX &middot; signals via SPY proxy (x1 / x10) &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
+  <p class="sub">XSP &middot; signals via SPY proxy &middot; fees: $3 in + $3 out &middot; refreshes every 60s &middot; generated ${new Date().toISOString()}</p>
 
   <h2>Open positions</h2>
   <table>
