@@ -94,7 +94,18 @@ const SYMBOLS = ["NVDA", "TSLA", "NFLX", "AAPL", "MSFT", "AMZN", "META", "GOOGL"
 const ENTRY_FEE = 3;
 const EXIT_FEE = 3;
 const MAX_CONTRACT_COST = 300; // skip a signal if the contract itself costs more than this (ask * 100), before fees
-const MIN_DAYS_OUT = 1; // never buy something expiring same-day — avoids a slow 15-min poll cycle missing a 0DTE exit
+// SAME-DAY TRIAL (2026-10-05, SMT/ICT test service only -- production's own
+// tradeEngine.js on main is separate and still uses 1): changed 1 -> 0 at the
+// user's request after a 90-day backtest (confirmed signals, 75% take-profit)
+// showed same-day expiry as the best total P&L (624 trades, 39.7% win rate,
+// +$22,143 vs 182 trades, 41.8%, +$7,289 at 1 day out). Read that result
+// with care: the backtest assumes a same-day contract exists EVERY weekday
+// (live stock options only list Mon/Wed/Fri here -- on other days
+// selectAtmContract just falls through to the next listed expiry) and it
+// cannot replay the live liquidity filter below, which blocked every XSP entry
+// on fresh 0DTE contracts. Exits are polled every 5 minutes, so a same-day
+// stop or take-profit can lag. To revert, set this back to 1.
+const MIN_DAYS_OUT = 0;
 const RISK_FREE_RATE = 0.05;
 const CONTRACTS_PER_TRADE = 1; // 1 contract per company, for now — each symbol tracked/closed independently, never stacked
 
