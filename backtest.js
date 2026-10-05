@@ -124,6 +124,11 @@ function backtestSymbol(bars, {
   // approximating SPX/SPXW's real same-day (0DTE) weekly-series contracts.
   // Overrides minDaysOut entirely when set (0DTE has no "days out").
   zeroDte = false,
+  // Opt-in: when true, only enter on signals the SMT/ICT live engine would
+  // actually take (analysis.signal.confirmed = order block + liquidity sweep).
+  // Default false keeps the old behavior (ANY BOS/CHoCH), which matches the
+  // Options Version, NOT the SMT/ICT live bot -- see the caveat in runBacktest.
+  requireConfirmed = false,
 } = {}) {
   const trades = [];
   let position = null;
@@ -179,6 +184,7 @@ function backtestSymbol(bars, {
     const windowBars = bars.slice(windowStart, i + 1);
     const analysis = findLatestSignal(windowBars, { swingStrength, lookback });
     if (!analysis.signal) continue;
+    if (requireConfirmed && !analysis.signal.confirmed) continue;
 
     const spot = scaledClose;
     const direction = analysis.signal.direction;
@@ -212,7 +218,7 @@ function backtestSymbol(bars, {
 // aggregating into the win/loss probability the user asked for. Needs live
 // Alpaca access (only reachable once deployed — this dev sandbox can't
 // reach data.alpaca.markets directly).
-async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit = 10000, takeProfitPct = null } = {}) {
+async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit = 10000, takeProfitPct = null, zeroDte = false, requireConfirmed = false } = {}) {
   const bySymbol = {};
   const allTrades = [];
 
@@ -220,7 +226,7 @@ async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit
     try {
       const bars = await alpacaClient.getBars(symbol, { timeframe: "15Min", limit, daysBack });
       if (!bars.length) { bySymbol[symbol] = { error: "No bars returned for this symbol/window." }; continue; }
-      const { trades, stillOpen } = backtestSymbol(bars, { takeProfitPct });
+      const { trades, stillOpen } = backtestSymbol(bars, { takeProfitPct, zeroDte, requireConfirmed });
       const tagged = trades.map((t) => ({ ...t, symbol }));
       allTrades.push(...tagged);
       const wins = tagged.filter((t) => t.outcome === "win").length;
@@ -248,6 +254,8 @@ async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit
     generatedAt: new Date().toISOString(),
     daysBack,
     symbols,
+    requireConfirmed, // true = SMT/ICT live behavior (order block + liquidity sweep gate); false = any BOS/CHoCH (Options Version behavior)
+    zeroDte, // true = every entry uses a same-day expiration (comparison lever only; NOT live behavior)
     takeProfitPct, // null = pure trailing stop (the live bot's real behavior); a number = fixed-TP comparison mode
     summary: {
       completedTrades,
@@ -261,6 +269,7 @@ async function runBacktest({ symbols = tradeEngine.SYMBOLS, daysBack = 90, limit
     trades: allTrades.sort((a, b) => new Date(a.entryTime) - new Date(b.entryTime)),
     caveats: [
       "Options pricing is APPROXIMATED (Black-Scholes with volatility estimated from the underlying's own recent realized moves) — Alpaca has no deep historical options quote data to replay exactly. Treat this as a check on the STRATEGY LOGIC, not a guarantee of exact real-world fills.",
+      zeroDte ? "zeroDte=true: expiration = SAME DAY as entry for EVERY symbol, every weekday. Real stock options do NOT list same-day contracts every day (your live September trades expired only Mon/Wed/Fri), so this OVERSTATES how often a 0DTE entry would actually be possible." : "zeroDte=false: expiration = next Friday approximation.",
       "Strike = nearest whole dollar to spot at entry; expiration = next Friday at least 1 day out — both approximate what selectAtmContract would have actually picked.",
       "The live liquidity filter (skip thin volume/open-interest contracts) could not be replayed — no historical options volume/OI data exists to check against.",
       "Signal detection, the trailing-stop ladder, fees, the $300 cap, and 1-contract-per-symbol sizing are the exact same code the live bot runs — not a separate re-implementation.",
