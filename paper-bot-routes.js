@@ -148,7 +148,9 @@ router.get("/backtest", async (req, res) => {
         : takeProfitPctRaw != null && takeProfitPctRaw !== ""
         ? parseFloat(takeProfitPctRaw)
         : tradeEngine.TAKE_PROFIT_PCT;
-    const result = await runBacktest({ symbols, daysBack, takeProfitPct });
+    const requireConfirmed = req.query.confirmed === "true" || req.query.confirmed === "1";
+    const zeroDte = req.query.zeroDte === "true" || req.query.zeroDte === "1";
+    const result = await runBacktest({ symbols, daysBack, takeProfitPct, zeroDte, requireConfirmed });
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
