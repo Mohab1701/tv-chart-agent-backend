@@ -13,6 +13,7 @@ const { findLatestSignal } = require("./smc");
 const tradeEngine = require("./tradeEngine");
 const { runBacktest } = require("./backtest");
 const { runOrbBacktest } = require("./orbBacktest");
+const { runSrBacktest } = require("./srBacktest");
 
 const router = express.Router();
 
@@ -201,6 +202,73 @@ router.get("/backtest-orb", async (req, res) => {
       minDaysOut: num(q.minDaysOut, 1),
       exitAtClose: bool(q.exitAtClose, true),
       orb,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /paper-bot/backtest-sr -- Support/Resistance (see sr.js / srBacktest.js):
+// daily levels (swing pivots clustered into zones + previous-day high/low/close)
+// with 5-minute entries. A NEW method being evaluated for the SMT/ICT test
+// service; nothing live uses it yet. Every parameter is optional and every
+// default is a first guess:
+//   ?mode=bounce|breakout   bounce = rejection at a level; breakout = break + retest (default bounce)
+//   ?daysBack=90            5-minute window (data only covers ~26 trading days)
+//   ?symbols=NVDA,TSLA      default: the full watchlist
+//   ?takeProfitPct=75       fixed take-profit; omit/none = trailing stop only
+//   ?zeroDte=true           same-day expiry (default: next Friday >= minDaysOut)
+//   ?minDaysOut=1           only used when zeroDte is off
+//   ?exitAtClose=false      hold past the close (default true: flat each day)
+//   ?levelStop=false        do NOT close when price closes through the level (default true)
+//   ?maxTradesPerDay=1      entries per symbol per day
+//   ?spreadPct=10&spreadMin=0.05   charge a bid/ask spread (default none)
+//   ?brief=true             leave out the per-trade list (smaller output)
+//   level params:  pivotN=3 lookbackDays=60 clusterPct=0.4 minTouches=2 prevDay=true
+//   signal params: touchPct=0.12 breakPct=0.10 minWickFrac=0.25 retestBars=12
+//                  entryFrom=09:45 entryUntil=14:30   (New York time)
+router.get("/backtest-sr", async (req, res) => {
+  try {
+    const q = req.query;
+    const num = (v, d) => (v != null && v !== "" && !Number.isNaN(parseFloat(v)) ? parseFloat(v) : d);
+    const bool = (v, d) => (v == null || v === "" ? d : v === "true" || v === "1");
+    const hm = (v) => {
+      if (!v || !/^\d{1,2}:\d{2}$/.test(v)) return undefined;
+      const [h, m] = v.split(":").map(Number);
+      return h * 60 + m;
+    };
+    const daysBack = q.daysBack ? parseInt(q.daysBack, 10) : 90;
+    const symbols = q.symbols
+      ? String(q.symbols).split(",").map((x) => x.trim().toUpperCase()).filter(Boolean)
+      : tradeEngine.SYMBOLS;
+    const tpRaw = q.takeProfitPct;
+    const takeProfitPct = tpRaw == null || tpRaw === "" || tpRaw === "none" || tpRaw === "off" ? null : parseFloat(tpRaw);
+    const mode = q.mode === "breakout" ? "breakout" : "bounce";
+
+    const levels = {
+      pivotN: num(q.pivotN, undefined), lookbackDays: num(q.lookbackDays, undefined),
+      clusterPct: num(q.clusterPct, undefined), minTouches: num(q.minTouches, undefined),
+      includePrevDay: q.prevDay != null ? bool(q.prevDay, true) : undefined,
+    };
+    const signal = {
+      mode, touchPct: num(q.touchPct, undefined), breakPct: num(q.breakPct, undefined),
+      minWickFrac: num(q.minWickFrac, undefined), retestBars: num(q.retestBars, undefined),
+      entryFromMinutes: hm(q.entryFrom), entryUntilMinutes: hm(q.entryUntil),
+    };
+    for (const o of [levels, signal]) for (const k of Object.keys(o)) if (o[k] === undefined) delete o[k];
+
+    const result = await runSrBacktest({
+      symbols, daysBack, takeProfitPct,
+      zeroDte: bool(q.zeroDte, false),
+      minDaysOut: num(q.minDaysOut, 1),
+      exitAtClose: bool(q.exitAtClose, true),
+      levelStop: bool(q.levelStop, true),
+      maxTradesPerDay: num(q.maxTradesPerDay, 1),
+      spreadPct: num(q.spreadPct, 0),
+      spreadMin: num(q.spreadMin, 0),
+      brief: bool(q.brief, false),
+      levels, signal,
     });
     res.json(result);
   } catch (err) {
