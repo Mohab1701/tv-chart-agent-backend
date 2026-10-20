@@ -12,6 +12,7 @@ const { getBars, getAccount, getOpenPositions, parseOccSymbol } = require("./alp
 const { findLatestSignal } = require("./smc");
 const tradeEngine = require("./tradeEngine");
 const { runBacktest } = require("./backtest");
+const { runOrbBacktest } = require("./orbBacktest");
 
 const router = express.Router();
 
@@ -151,6 +152,56 @@ router.get("/backtest", async (req, res) => {
     const requireConfirmed = req.query.confirmed === "true" || req.query.confirmed === "1";
     const zeroDte = req.query.zeroDte === "true" || req.query.zeroDte === "1";
     const result = await runBacktest({ symbols, daysBack, takeProfitPct, zeroDte, requireConfirmed });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /paper-bot/backtest-orb -- Opening Range Breakout (see orb.js /
+// orbBacktest.js) on real 5-minute bars. A NEW method being evaluated for
+// the SMT/ICT test service; nothing live uses it yet. Every parameter is
+// optional and every default is a first guess:
+//   ?daysBack=90            history window
+//   ?symbols=NVDA,TSLA      default: the full watchlist
+//   ?takeProfitPct=75       fixed take-profit; omit/none = trailing stop only
+//   ?zeroDte=true           same-day expiry (default: next Friday >= minDaysOut)
+//   ?minDaysOut=1           only used when zeroDte is off
+//   ?exitAtClose=false      hold past the close (default true: flat each day)
+//   ?rangeMinutes=30        opening range length
+//   ?entryUntil=11:30       no entries after this New York time
+//   ?volMult=1.0            breakout-bar volume vs opening-range average (0 = off)
+//   ?minRangePct=0.15&maxRangePct=3
+router.get("/backtest-orb", async (req, res) => {
+  try {
+    const q = req.query;
+    const num = (v, d) => (v != null && v !== "" && !Number.isNaN(parseFloat(v)) ? parseFloat(v) : d);
+    const bool = (v, d) => (v == null || v === "" ? d : v === "true" || v === "1");
+    const daysBack = q.daysBack ? parseInt(q.daysBack, 10) : 90;
+    const symbols = q.symbols
+      ? String(q.symbols).split(",").map((x) => x.trim().toUpperCase()).filter(Boolean)
+      : tradeEngine.SYMBOLS;
+    const tpRaw = q.takeProfitPct;
+    const takeProfitPct = tpRaw == null || tpRaw === "" || tpRaw === "none" || tpRaw === "off" ? null : parseFloat(tpRaw);
+
+    const orb = {};
+    if (q.rangeMinutes != null) orb.rangeMinutes = num(q.rangeMinutes, undefined);
+    if (q.volMult != null) orb.volMult = num(q.volMult, undefined);
+    if (q.minRangePct != null) orb.minRangePct = num(q.minRangePct, undefined);
+    if (q.maxRangePct != null) orb.maxRangePct = num(q.maxRangePct, undefined);
+    if (q.entryUntil && /^\d{1,2}:\d{2}$/.test(q.entryUntil)) {
+      const [h, m] = q.entryUntil.split(":").map(Number);
+      orb.entryUntilMinutes = h * 60 + m;
+    }
+    for (const k of Object.keys(orb)) if (orb[k] === undefined) delete orb[k];
+
+    const result = await runOrbBacktest({
+      symbols, daysBack, takeProfitPct,
+      zeroDte: bool(q.zeroDte, false),
+      minDaysOut: num(q.minDaysOut, 1),
+      exitAtClose: bool(q.exitAtClose, true),
+      orb,
+    });
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
