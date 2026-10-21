@@ -1,0 +1,27 @@
+# Copy this file to a new file named ".env" (same folder) and fill in the values. NEVER commit .env to GitHub.
+
+# Alpaca: used ONLY for stock price bars (the same free data the strategy was tested on).
+# Use the same paper keys already set on the Render SMT service.
+ALPACA_KEY_ID=
+ALPACA_SECRET_KEY=
+
+# Which broker places orders: "ibkr" = Interactive Brokers (Derayah Global), "alpaca" = Alpaca paper.
+BROKER=ibkr
+# paper = refuses any account that is not a paper (DU...) account. Leave as paper for now.
+IB_MODE=paper
+# IB Gateway paper = 4002. (TWS paper = 7497.) Must match Gateway's API settings.
+IB_PORT=4002
+IB_HOST=127.0.0.1
+IB_CLIENT_ID=17
+
+# Strategy and switches
+ENTRY_METHOD=sr-bounce
+AUTO_CYCLE=true
+# Set to false to stop ALL new orders immediately (the bot keeps running and reading).
+TRADING_ENABLED=true
+
+# The server wants a value here even though the trading bot does not use it.
+ANTHROPIC_API_KEY=unused
+
+# Optional phone notifications (same as on Render)
+NTFY_TOPIC=
