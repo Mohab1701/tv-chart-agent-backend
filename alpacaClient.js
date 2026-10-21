@@ -125,11 +125,16 @@ async function getOrders({ status = "closed", limit = 100, symbols } = {}) {
 // Places a market order to open (or close) a position. `symbol` here is the
 // OCC option symbol (e.g. "NVDA260918C00500000") for an options order, or
 // the plain ticker for a stock order.
-async function placeOrder({ symbol, qty = 1, side = "buy", type = "market", time_in_force = "day" }) {
+// `client_order_id` is optional: when given, Alpaca stores it on the order
+// (durably, on their side), which the SR bounce entry uses to remember which
+// support/resistance level a trade was based on without needing a database.
+async function placeOrder({ symbol, qty = 1, side = "buy", type = "market", time_in_force = "day", client_order_id }) {
+  const body = { symbol, qty, side, type, time_in_force };
+  if (client_order_id) body.client_order_id = client_order_id;
   return alpacaFetch(`${TRADING_BASE}/orders`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ symbol, qty, side, type, time_in_force }),
+    body: JSON.stringify(body),
   });
 }
 
