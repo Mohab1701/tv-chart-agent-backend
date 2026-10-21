@@ -22,6 +22,9 @@ const alpacaClient = require("./alpacaClient");
 const { findSwings, findLatestSignal, nearestTarget } = require("./smc");
 const { blackScholes, impliedVolatility, initialLadder } = require("./blackScholes");
 const peakStore = require("./peakStore");
+const srLive = require("./srLive");
+const { nyParts } = require("./orb");
+const { SIGNAL_DEFAULTS: SR_SIGNAL_DEFAULTS } = require("./sr");
 
 // Push notifications -- reads the topic name from an env var, same
 // discipline as the Alpaca keys: never hardcode it into a committed file.
@@ -107,6 +110,24 @@ const MAX_CONTRACT_COST = 300; // skip a signal if the contract itself costs mor
 // stop or take-profit can lag. To revert, set this back to 1.
 const MIN_DAYS_OUT = 0;
 const RISK_FREE_RATE = 0.05;
+// ENTRY METHOD (SMT/ICT test service only; production's tradeEngine.js on main
+// is a separate file and is not affected by any of this).
+//   "sr-bounce" (default): Support/Resistance BOUNCE on daily levels -- see sr.js
+//               and srLive.js. Trailing-stop ladder ONLY (no fixed take-profit),
+//               plus a level-break exit and an end-of-day close. Backtest
+//               evidence: /paper-bot/backtest-sr?mode=bounce&zeroDte=true
+//               (about 26 trading days; modeled option prices -- a first look,
+//               not proof; the live run is the real test).
+//   "smc":      the previous SMT/ICT entry (confirmed BOS/CHoCH + 75% take-profit).
+//               To switch back WITHOUT a code change, set the Render environment
+//               variable ENTRY_METHOD=smc and redeploy/restart the service.
+const ENTRY_METHOD = String(process.env.ENTRY_METHOD || "sr-bounce").trim().toLowerCase() === "smc" ? "smc" : "sr-bounce";
+// SR bounce entry guards. The old volume/open-interest gate (100/500) blocked
+// fresh same-day contracts (volume is tiny early in the day), so for this method
+// it is replaced by a lighter open-interest floor plus a bid/ask spread cap.
+// Both are first guesses -- tune them from what the live cycle reports.
+const SR_MIN_OPEN_INTEREST = 100;
+const SR_MAX_SPREAD_PER_SHARE = 0.10; // skip if ask - bid is wider than this ($0.10 = $10 per contract)
 const CONTRACTS_PER_TRADE = 1; // 1 contract per company, for now — each symbol tracked/closed independently, never stacked
 
 // SIMULATED wallet size -- NOT a real Alpaca balance check. The paper
@@ -219,7 +240,7 @@ function totalCommittedCapital(openPositions) {
 }
 
 // ---- ENTRY -----------------------------------------------------------------
-async function evaluateAndMaybeEnter(symbol) {
+async function evaluateAndMaybeEnterSmc(symbol) {
   const openPositions = await alpacaClient.getOpenPositions();
   const alreadyHolding = (openPositions || []).some(
     (p) => p.asset_class === "us_option" && positionBelongsTo(p, symbol)
@@ -320,6 +341,125 @@ async function evaluateAndMaybeEnter(symbol) {
   };
 }
 
+// ---- ENTRY: SUPPORT/RESISTANCE BOUNCE ---------------------------------------
+// Runs on every cycle for a symbol with no open position. See srLive.js for what
+// the signal is and how it differs from the backtest.
+async function evaluateAndMaybeEnterSr(symbol, ctx = {}) {
+  const now = new Date();
+  const openPositions = await alpacaClient.getOpenPositions();
+  const alreadyHolding = (openPositions || []).some(
+    (p) => p.asset_class === "us_option" && positionBelongsTo(p, symbol)
+  );
+  if (alreadyHolding) {
+    return { action: "skip", reason: `Already holding an open ${symbol} option position — not stacking a second one.` };
+  }
+
+  // Nothing new late in the session: the entry window ends 14:30 ET and the
+  // end-of-day close starts 15:45 ET (a trade opened after that would be closed at once).
+  if (srLive.isEodCloseTime(now)) {
+    return { action: "skip", reason: "End-of-day window (15:45 ET or later) — no new SR entries." };
+  }
+
+  // One trade per symbol per day, remembered via Alpaca's own order history.
+  if (!ctx.boughtToday) ctx.boughtToday = await srLive.rootsBoughtToday(alpacaClient, now);
+  if (ctx.boughtToday.has(symbol)) {
+    return { action: "skip", reason: `Already traded ${symbol} today — the SR bounce takes at most one trade per symbol per day.` };
+  }
+
+  const et = nyParts(now);
+  const [rawBars5m, dailyBars] = await Promise.all([
+    alpacaClient.getBars(symbol, { timeframe: "5Min", limit: 400, daysBack: 6 }),
+    srLive.getDailyBars(alpacaClient, symbol, et.date),
+  ]);
+  if (!rawBars5m.length) {
+    return { action: "skip", reason: "No 5-minute bars returned (market closed with no recent data, or feed issue)." };
+  }
+
+  const found = srLive.findLiveSignal({ rawBars5m, dailyBars, now });
+  if (!found.signal) {
+    return { action: "no-signal", reason: found.reason, levels: found.levelCount };
+  }
+
+  const signal = found.signal;
+  const direction = signal.direction; // "call" | "put"
+  const spot = found.spot;
+
+  const { contract, reason: selectReason } = await alpacaClient.selectAtmContract(symbol, spot, direction, { minDaysOut: MIN_DAYS_OUT });
+  if (!contract) {
+    return { action: "skip", reason: selectReason, signal };
+  }
+
+  if (contract.openInterest < SR_MIN_OPEN_INTEREST) {
+    return {
+      action: "skip",
+      reason: `${contract.symbol} is too thin to trade (open interest ${contract.openInterest}, needs at least ${SR_MIN_OPEN_INTEREST}), skipping even though the bounce signal is valid.`,
+      signal, contract,
+    };
+  }
+  if (contract.bid == null || contract.bid <= 0) {
+    return { action: "skip", reason: `${contract.symbol} has no live bid (ask ${contract.ask}) — cannot size a safe exit, skipping.`, signal, contract };
+  }
+  const spread = +(contract.ask - contract.bid).toFixed(4);
+  if (spread > SR_MAX_SPREAD_PER_SHARE) {
+    return {
+      action: "skip",
+      reason: `${contract.symbol} quoted spread is $${spread} per share ($${(spread * 100).toFixed(0)} per contract) — wider than the $${SR_MAX_SPREAD_PER_SHARE} cap, skipping even though the bounce signal is valid.`,
+      signal, contract,
+    };
+  }
+
+  const contractCost = contract.ask * 100;
+  if (contractCost > MAX_CONTRACT_COST) {
+    return {
+      action: "skip",
+      reason: `${contract.symbol} costs $${contractCost.toFixed(2)} per contract — above the $${MAX_CONTRACT_COST} cap, skipping even though the signal looks valid.`,
+      signal, contract,
+    };
+  }
+
+  const entryCostWithFee = +(contractCost + ENTRY_FEE).toFixed(2);
+  const committed = totalCommittedCapital(openPositions);
+  const projectedTotal = +(committed + entryCostWithFee).toFixed(2);
+  if (projectedTotal > SIMULATED_WALLET_SIZE) {
+    return {
+      action: "skip",
+      reason: `${contract.symbol} would cost $${entryCostWithFee} on top of $${committed.toFixed(2)} already committed to other open positions ($${projectedTotal} total) — over the simulated $${SIMULATED_WALLET_SIZE} wallet cap. Skipping even though the signal looks valid.`,
+      signal, contract,
+    };
+  }
+
+  const clientOrderId = srLive.makeClientOrderId(symbol, signal.level.price, signal.level.touches, now);
+  const order = await alpacaClient.placeOrder({
+    symbol: contract.symbol, qty: CONTRACTS_PER_TRADE, side: "buy", type: "market", time_in_force: "day",
+    client_order_id: clientOrderId,
+  });
+  ctx.boughtToday.add(symbol);
+
+  const sameDay = contract.expirationDate === et.date;
+  await notify(
+    `Entered ${symbol} ${direction.toUpperCase()} (SR bounce)`,
+    `Bought ${CONTRACTS_PER_TRADE}x ${contract.symbol} @ $${contract.ask} — cost incl. $${ENTRY_FEE} fee: $${entryCostWithFee}. Level ${signal.level.price} (${signal.level.touches} touch${signal.level.touches === 1 ? "" : "es"}).${sameDay ? "" : " NOTE: not a same-day contract (none listed today); closes at end of day."}`
+  );
+
+  return {
+    action: "entered",
+    symbol,
+    direction,
+    contract,
+    order,
+    entryCostRaw: +contractCost.toFixed(2),
+    entryCostWithFee,
+    signal,
+    sameDayContract: sameDay,
+    reason: `${found.reason} Bought ${CONTRACTS_PER_TRADE}x ${contract.symbol} @ $${contract.ask} (cost incl. $${ENTRY_FEE} fee: $${entryCostWithFee})${sameDay ? "" : "; no same-day contract listed today, used the next expiry and will close at end of day"}.`,
+  };
+}
+
+// Which entry method is active is decided by ENTRY_METHOD (see its comment above).
+async function evaluateAndMaybeEnter(symbol, ctx = {}) {
+  return ENTRY_METHOD === "smc" ? evaluateAndMaybeEnterSmc(symbol) : evaluateAndMaybeEnterSr(symbol, ctx);
+}
+
 // Pure READ-ONLY computation of where a position stands right now: current
 // net-if-sold, its stop-loss line, and a freshly recomputed take-profit
 // line. No side effects — safe to call from the dashboard on every page
@@ -402,26 +542,62 @@ async function computeLiveLevels(position) {
   };
 }
 
+// SR bounce extra exit doors (only when ENTRY_METHOD is "sr-bounce"), checked
+// AFTER the trailing stop. They mirror the backtest's exit rules:
+//   - end of day: every SR trade is closed from 15:45 ET (and any position that
+//     expires today, whatever opened it)
+//   - level-break: a completed 5-minute bar, after entry, closed through the
+//     support/resistance level the trade was based on (the level is read back
+//     from the buy order's client_order_id -- see srLive.js)
+// Never throws: a lookup failure just means "no extra exit this cycle".
+async function srExtraExit(position, parsed) {
+  const now = new Date();
+  const et = nyParts(now);
+  let info = null;
+  try { info = await srLive.entryInfoForPosition(alpacaClient, position.symbol); } catch (err) { /* fall through */ }
+  const isSrTrade = !!(info && info.level);
+
+  if (srLive.isEodCloseTime(now) && (isSrTrade || parsed.expirationDate === et.date)) {
+    return { reason: "eod-close", detail: `end-of-day close (${Math.floor(et.minutes / 60)}:${String(et.minutes % 60).padStart(2, "0")} ET, closes from 15:45 ET)` };
+  }
+
+  if (isSrTrade) {
+    try {
+      const rawBars5m = await alpacaClient.getBars(parsed.root, { timeframe: "5Min", limit: 60, daysBack: 3 });
+      const r = srLive.levelBreakSince({
+        direction: parsed.type, levelPrice: info.level.levelPrice, rawBars5m,
+        enteredAtMs: info.enteredAtMs, now, breakPct: SR_SIGNAL_DEFAULTS.breakPct,
+      });
+      if (r.broken) {
+        return { reason: "level-break", detail: `a 5-minute bar closed at ${r.bar.c}, through the ${info.level.levelPrice} level this ${parsed.type} was based on` };
+      }
+    } catch (err) { /* fall through */ }
+  }
+  return null;
+}
+
 // ---- EXIT -------------------------------------------------------------------
-// Exit is the trailing stop PLUS a fixed take-profit door (see
-// TAKE_PROFIT_PCT's comment above for the backtest evidence behind adding
-// this back). Below +40% peak profit, the stop is just the initial
-// 45%-loss line; above it, the stop ratchets up in 20% steps and never
-// gives back more than one step's worth of profit. Whichever of the two
-// exit conditions is reached first wins -- same "first condition in bar
-// order" rule backtestSymbol already used for this A/B lever, so live
-// behavior now matches exactly what was backtested. targetLevel is still
-// shown on the dashboard as a reference (where structure suggests price
-// could go), but it still never triggers a close on its own.
+// Exit is the trailing stop PLUS (for the SMC method only) a fixed take-profit
+// door (see TAKE_PROFIT_PCT's comment above for the backtest evidence behind
+// that). The SR bounce method is trailing-stop ONLY -- no fixed take-profit --
+// because that is what was backtested, plus the level-break and end-of-day exits
+// in srExtraExit above. Below +40% peak profit the stop is the initial 45%-loss
+// line; above it, the stop ratchets up in steps and never gives back more than
+// one step's worth of profit. Whichever condition is reached first wins.
+// targetLevel is still shown on the dashboard as a reference, but never
+// triggers a close on its own.
 async function evaluateAndMaybeExit(position) {
   const levels = await computeLiveLevels(position);
   if (levels.error) return { action: "hold", reason: levels.error };
 
   const { parsed, netIfSoldNow, trailStop, peakNet, targetLevel, entryCostWithFee } = levels;
-  const fixedTP = TAKE_PROFIT_PCT != null ? +(entryCostWithFee * (1 + TAKE_PROFIT_PCT / 100)).toFixed(2) : null;
+  const takeProfitPct = ENTRY_METHOD === "sr-bounce" ? null : TAKE_PROFIT_PCT;
+  const fixedTP = takeProfitPct != null ? +(entryCostWithFee * (1 + takeProfitPct / 100)).toFixed(2) : null;
   const hitFixedTP = fixedTP != null && netIfSoldNow >= fixedTP;
+  const hitStop = netIfSoldNow <= trailStop;
+  const extra = !hitFixedTP && !hitStop && ENTRY_METHOD === "sr-bounce" ? await srExtraExit(position, parsed) : null;
 
-  if (hitFixedTP || netIfSoldNow <= trailStop) {
+  if (hitFixedTP || hitStop || extra) {
     const closeOrder = await alpacaClient.closePosition(position.symbol);
     // Position is done -- drop its remembered peak so nothing stale lingers
     // (see peakStore.clearPeak's comment for why this matters, however
@@ -430,16 +606,21 @@ async function evaluateAndMaybeExit(position) {
     peakStore.clearPeak(position.symbol);
     const exitReason = hitFixedTP
       ? "take-profit"
-      : (trailStop > levels.entryCostWithFee ? "trailing-stop (locked in profit)" : "stop-loss");
-    const thresholdHit = hitFixedTP ? fixedTP : trailStop;
-    await notify(
-      `Closed: ${parsed.root}`,
-      `Closed ${position.symbol} — net proceeds $${netIfSoldNow} ${hitFixedTP ? ">=" : "<="} ${hitFixedTP ? "take-profit" : "stop"} $${thresholdHit} (peak was $${peakNet}).`
-    );
+      : hitStop
+        ? (trailStop > levels.entryCostWithFee ? "trailing-stop (locked in profit)" : "stop-loss")
+        : extra.reason;
+    const message = hitFixedTP
+      ? `Closed ${position.symbol} — net proceeds $${netIfSoldNow} >= take-profit $${fixedTP} (peak was $${peakNet}).`
+      : hitStop
+        ? `Closed ${position.symbol} — net proceeds $${netIfSoldNow} <= stop $${trailStop} (peak was $${peakNet}).`
+        : `Closed ${position.symbol} — ${extra.detail}; net proceeds $${netIfSoldNow} (peak was $${peakNet}).`;
+    await notify(`Closed: ${parsed.root}`, message);
     return {
       action: "exited", exitReason, symbol: parsed.root,
       netProceeds: netIfSoldNow, trailStop, fixedTP, peakNet, closeOrder,
-      reason: `${exitReason} hit: net proceeds $${netIfSoldNow} vs stop $${trailStop}${fixedTP != null ? ` / take-profit $${fixedTP}` : ""} (peak reached $${peakNet}). Closed ${position.symbol}.`,
+      reason: hitFixedTP || hitStop
+        ? `${exitReason} hit: net proceeds $${netIfSoldNow} vs stop $${trailStop}${fixedTP != null ? ` / take-profit $${fixedTP}` : ""} (peak reached $${peakNet}). Closed ${position.symbol}.`
+        : `${exitReason}: ${extra.detail}. Net proceeds $${netIfSoldNow}, stop was $${trailStop} (peak reached $${peakNet}). Closed ${position.symbol}.`,
     };
   }
 
@@ -566,10 +747,11 @@ async function runCycle(symbols = SYMBOLS) {
   // closed some other way (e.g. manually, or a crash mid-close).
   peakStore.pruneToSymbols(openPositions.map((p) => p.symbol));
   const results = {};
+  const ctx = {}; // per-cycle cache (SR bounce: symbols already bought today)
   for (const symbol of symbols) {
     try {
       const existing = openPositions.find((p) => positionBelongsTo(p, symbol));
-      results[symbol] = existing ? await evaluateAndMaybeExit(existing) : await evaluateAndMaybeEnter(symbol);
+      results[symbol] = existing ? await evaluateAndMaybeExit(existing) : await evaluateAndMaybeEnter(symbol, ctx);
     } catch (err) {
       results[symbol] = { action: "error", reason: err.message };
     }
@@ -588,6 +770,9 @@ module.exports = {
   SIGNAL_LOOKBACK_BARS,
   SIMULATED_WALLET_SIZE,
   TAKE_PROFIT_PCT,
+  ENTRY_METHOD,
+  SR_MIN_OPEN_INTEREST,
+  SR_MAX_SPREAD_PER_SHARE,
   liquidityThresholdFor,
   yearsUntil,
   positionBelongsTo,
@@ -597,6 +782,8 @@ module.exports = {
   computeLiveLevels,
   reconstructIntendedExit,
   evaluateAndMaybeEnter,
+  evaluateAndMaybeEnterSmc,
+  evaluateAndMaybeEnterSr,
   evaluateAndMaybeExit,
   getClosedTrades,
   runCycle,
