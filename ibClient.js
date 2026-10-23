@@ -28,6 +28,8 @@ const path = require("path");
 const { nyParts } = require("./orb");
 
 const OCC_RE = /^([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/;
+// Subscription notices that are only warnings while IB_ALLOW_DELAYED=true (delayed ticks still stream). Otherwise they stay hard errors.
+const DELAYED_WARNING_CODES = new Set([354, 10090, 10091]);
 const IGNORABLE_CODES = new Set([2100, 2101, 2102, 2103, 2104, 2105, 2106, 2107, 2108, 2109, 2110, 2119, 2137, 2158, 10167, 10168, 10285]);
 
 function parseOcc(occ) {
@@ -76,6 +78,7 @@ function createIbClient(opts = {}) {
     connectTimeoutMs: opts.connectTimeoutMs || 10000,
     requestTimeoutMs: opts.requestTimeoutMs || 8000,
     quoteTimeoutMs: opts.quoteTimeoutMs || 4000,
+    positionsTimeoutMs: opts.positionsTimeoutMs || 15000,
     fillTimeoutMs: opts.fillTimeoutMs != null ? opts.fillTimeoutMs : 10000,
     journalPath: opts.journalPath || env.IB_JOURNAL_PATH || path.join(__dirname, "data", "ib-journal.json"),
     execTimeZone: env.IB_EXEC_TIME_ZONE || "America/New_York",
@@ -83,7 +86,8 @@ function createIbClient(opts = {}) {
   const lib = opts.lib || require("@stoqey/ib");
   const { IBApi, EventName, SecType, OptionType, OrderAction, OrderType, TimeInForce, MarketDataType } = lib;
   const tradingEnabled = () => String(env.TRADING_ENABLED == null ? "true" : env.TRADING_ENABLED).toLowerCase() !== "false";
-  let warned10091 = false;
+  let warnedDelayed = false;
+  let warnedOi = false;
   const allowDelayed = () => String(env.IB_ALLOW_DELAYED || "false").toLowerCase() === "true";
 
   let api = null, connected = false, connecting = null, account = null, nextOrderId = null, seq = 5000;
@@ -141,10 +145,10 @@ function createIbClient(opts = {}) {
           return finish(new Error(`IB connection failed, code ${code}${hint}`));
         }
         if (IGNORABLE_CODES.has(code)) return;
-        // 10091 = "part of the requested market data needs an extra subscription; delayed data is available".
+        // 10090 / 10091 / 354 = "market data needs an extra subscription; delayed data is available".
         // With IB_ALLOW_DELAYED=true the delayed ticks still stream, so it is only a warning (testing mode).
         // Without it, it stays a hard error so the bot never trades without real-time prices.
-        if (code === 10091 && allowDelayed()) { if (!warned10091) { warned10091 = true; log("IB 10091: no real-time subscription, using DELAYED data (IB_ALLOW_DELAYED=true, testing only)"); } return; }
+        if (DELAYED_WARNING_CODES.has(code) && allowDelayed()) { if (!warnedDelayed) { warnedDelayed = true; log(`IB ${code}: no real-time subscription, using DELAYED data (IB_ALLOW_DELAYED=true, testing only)`); } return; }
         const fn = pendingErrors.get(reqId);
         if (fn) fn(Object.assign(new Error(`IB error ${code}: ${err && err.message ? err.message : err}`), { code }));
         else if (code !== 2150) log(`IB error ${code} (req ${reqId}): ${err && err.message ? err.message : err}`);
@@ -264,6 +268,19 @@ function createIbClient(opts = {}) {
     }, cfg.quoteTimeoutMs, `quote ${contract.symbol}`, () => { try { a.cancelMktData(id); } catch (e) { /* ignore */ } return q; }); // on timeout, return whatever ticks arrived
   }
 
+  // Open interest. Real-time data always carries it. IB may not send it on DELAYED data; in that
+  // TEST mode only, assume the minimum so the liquidity check does not block the plumbing test
+  // (spread is still checked from the quoted bid/ask). Real-time mode never assumes anything.
+  function openInterestFor(q) {
+    if (q.openInterest != null) return q.openInterest;
+    if (allowDelayed()) {
+      const assumed = Number(env.IB_DELAYED_ASSUME_OI) || 100;
+      if (!warnedOi) { warnedOi = true; log(`open interest not provided on delayed data; assuming ${assumed} (testing only)`); }
+      return assumed;
+    }
+    return 0;
+  }
+
   function toAlpacaQuote(q) {
     return { ask: q.ask, bid: q.bid, impliedVolatility: q.iv, greeks: q.greeks, delayed: q.delayed, volume: q.volume, openInterest: q.openInterest };
   }
@@ -306,7 +323,7 @@ function createIbClient(opts = {}) {
           contract: {
             symbol: occ, strike, expirationDate: `${exp.slice(0, 4)}-${exp.slice(4, 6)}-${exp.slice(6, 8)}`, type: direction,
             ask: q.ask, bid: q.bid, impliedVolatility: q.iv, greeks: q.greeks,
-            volume: q.volume != null ? q.volume : 0, openInterest: q.openInterest != null ? q.openInterest : 0,
+            volume: q.volume != null ? q.volume : 0, openInterest: openInterestFor(q),
           },
           reason: null,
         };
@@ -318,12 +335,22 @@ function createIbClient(opts = {}) {
   // ---- positions / account ----------------------------------------------------
   async function getOpenPositions() {
     const a = await ensureConnected();
-    const id = nextReqId();
-    const raw = await request(a, id, () => a.reqPositions(), (on, end) => {
-      const rows = [];
-      on(EventName.position, (acct, contract, pos, avgCost) => { if (acct === account) rows.push({ contract, pos, avgCost }); });
-      on(EventName.positionEnd, () => { try { a.cancelPositions(); } catch (e) { /* ignore */ } end(null, rows); });
-    }, cfg.requestTimeoutMs, "positions");
+    let raw;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const id = nextReqId();
+      try {
+        raw = await request(a, id, () => a.reqPositions(), (on, end) => {
+          const rows = [];
+          on(EventName.position, (acct, contract, pos, avgCost) => { if (acct === account) rows.push({ contract, pos, avgCost }); });
+          on(EventName.positionEnd, () => { try { a.cancelPositions(); } catch (e) { /* ignore */ } end(null, rows); });
+        }, Math.max(cfg.requestTimeoutMs, cfg.positionsTimeoutMs), "positions");
+        break;
+      } catch (e) {
+        try { a.cancelPositions(); } catch (e2) { /* ignore */ } // never leave a stale positions subscription behind
+        if (attempt === 2 || !/timed out/.test(e.message)) throw e;
+        log("positions request timed out, retrying once");
+      }
+    }
     const journal = readJournal();
     const out = [];
     for (const r of raw) {
