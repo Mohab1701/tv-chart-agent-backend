@@ -83,6 +83,7 @@ function createIbClient(opts = {}) {
   const lib = opts.lib || require("@stoqey/ib");
   const { IBApi, EventName, SecType, OptionType, OrderAction, OrderType, TimeInForce, MarketDataType } = lib;
   const tradingEnabled = () => String(env.TRADING_ENABLED == null ? "true" : env.TRADING_ENABLED).toLowerCase() !== "false";
+  let warned10091 = false;
   const allowDelayed = () => String(env.IB_ALLOW_DELAYED || "false").toLowerCase() === "true";
 
   let api = null, connected = false, connecting = null, account = null, nextOrderId = null, seq = 5000;
@@ -127,7 +128,7 @@ function createIbClient(opts = {}) {
         if (!gotId || !gotAcct) return;
         try { assertAccountAllowed(account); } catch (e) { return finish(e); }
         try { a.reqMarketDataType(allowDelayed() ? MarketDataType.DELAYED : MarketDataType.REALTIME); } catch (e) { /* ignore */ }
-        log(`connected to IB ${cfg.host}:${cfg.port} as ${account} (${cfg.mode} mode)`);
+        log(`connected to IB ${cfg.host}:${cfg.port} as ${account} (${cfg.mode} mode${allowDelayed() ? ", DELAYED data allowed" : ""})`);
         finish(null);
       };
       const timer = setTimeout(() => finish(new Error(`Could not connect to IB Gateway at ${cfg.host}:${cfg.port} within ${cfg.connectTimeoutMs / 1000}s. Is Gateway running, logged in, with the API enabled on that port?`)), cfg.connectTimeoutMs);
@@ -140,6 +141,10 @@ function createIbClient(opts = {}) {
           return finish(new Error(`IB connection failed, code ${code}${hint}`));
         }
         if (IGNORABLE_CODES.has(code)) return;
+        // 10091 = "part of the requested market data needs an extra subscription; delayed data is available".
+        // With IB_ALLOW_DELAYED=true the delayed ticks still stream, so it is only a warning (testing mode).
+        // Without it, it stays a hard error so the bot never trades without real-time prices.
+        if (code === 10091 && allowDelayed()) { if (!warned10091) { warned10091 = true; log("IB 10091: no real-time subscription, using DELAYED data (IB_ALLOW_DELAYED=true, testing only)"); } return; }
         const fn = pendingErrors.get(reqId);
         if (fn) fn(Object.assign(new Error(`IB error ${code}: ${err && err.message ? err.message : err}`), { code }));
         else if (code !== 2150) log(`IB error ${code} (req ${reqId}): ${err && err.message ? err.message : err}`);
