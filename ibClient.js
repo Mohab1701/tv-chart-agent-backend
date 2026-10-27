@@ -272,10 +272,12 @@ function createIbClient(opts = {}) {
   // TEST mode only, assume the minimum so the liquidity check does not block the plumbing test
   // (spread is still checked from the quoted bid/ask). Real-time mode never assumes anything.
   function openInterestFor(q) {
-    if (q.openInterest != null) return q.openInterest;
+    // Delayed data often reports open interest as 0 or leaves it out; a real 0 cannot be told apart from
+    // "not provided" there, so in delayed TEST mode both count as unknown. Real-time mode keeps the real value.
+    if (q.openInterest != null && !(allowDelayed() && q.openInterest <= 0)) return q.openInterest;
     if (allowDelayed()) {
       const assumed = Number(env.IB_DELAYED_ASSUME_OI) || 100;
-      if (!warnedOi) { warnedOi = true; log(`open interest not provided on delayed data; assuming ${assumed} (testing only)`); }
+      if (!warnedOi) { warnedOi = true; log(`open interest not provided (or 0) on delayed data; assuming ${assumed} (testing only)`); }
       return assumed;
     }
     return 0;
