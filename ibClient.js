@@ -335,10 +335,35 @@ function createIbClient(opts = {}) {
   }
 
   // ---- positions / account ----------------------------------------------------
+  // Last-resort view of open positions, rebuilt from OUR journal (filled buys minus filled sells,
+  // not yet expired). Used ONLY when IB will not answer the positions request, so the bot can still
+  // close trades at end of day instead of leaving them open overnight.
+  function journalPositions() {
+    const today = nyParts(new Date()).date.replace(/-/g, "");
+    const net = new Map(), lastBuy = new Map();
+    for (const j of readJournal()) {
+      if (!j.symbol || j.status !== "filled") continue;
+      const q = Number(j.qty) || 1;
+      net.set(j.symbol, (net.get(j.symbol) || 0) + (j.side === "buy" ? q : -q));
+      if (j.side === "buy" && j.avgPrice != null) {
+        const prev = lastBuy.get(j.symbol);
+        if (!prev || String(j.filledAt) > String(prev.filledAt)) lastBuy.set(j.symbol, j);
+      }
+    }
+    const out = [];
+    for (const [occ, n] of net) {
+      const p = parseOcc(occ), buy = lastBuy.get(occ);
+      if (!p || !buy || n <= 0 || p.yyyymmdd < today) continue;
+      out.push({ asset_class: "us_option", symbol: occ, qty: String(n), side: "long", avg_entry_price: String(+Number(buy.avgPrice).toFixed(4)), current_price: null });
+    }
+    return out;
+  }
+
   async function getOpenPositions() {
     const a = await ensureConnected();
     let raw;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    const attempts = 3;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
       const id = nextReqId();
       try {
         raw = await request(a, id, () => a.reqPositions(), (on, end) => {
@@ -349,8 +374,14 @@ function createIbClient(opts = {}) {
         break;
       } catch (e) {
         try { a.cancelPositions(); } catch (e2) { /* ignore */ } // never leave a stale positions subscription behind
-        if (attempt === 2 || !/timed out/.test(e.message)) throw e;
-        log("positions request timed out, retrying once");
+        if (!/timed out/.test(e.message)) throw e;
+        if (attempt === attempts) {
+          if (String(env.IB_POSITIONS_JOURNAL_FALLBACK || "true").toLowerCase() === "false") throw e;
+          const fb = journalPositions();
+          log(`positions request timed out ${attempts} times; using the bot's own journal instead (${fb.length} open position(s)).`);
+          return fb;
+        }
+        log(`positions request timed out, retrying (${attempt}/${attempts - 1})`);
       }
     }
     const journal = readJournal();
