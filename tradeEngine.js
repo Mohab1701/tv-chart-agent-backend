@@ -97,6 +97,11 @@ const SYMBOLS = ["NVDA", "TSLA", "NFLX", "AAPL", "MSFT", "AMZN", "META", "GOOGL"
 const ENTRY_FEE = 3;
 const EXIT_FEE = 3;
 const MAX_CONTRACT_COST = 300; // skip a signal if the contract itself costs more than this (ask * 100), before fees
+// Floor on the same number: a contract this cheap (ask * 100 below the floor, before fees) is
+// mostly spread -- e.g. a $0.13 option that loses ~$13 just from buying at the ask and selling
+// at the bid. Skipped even when the signal looks valid. Set MIN_CONTRACT_COST=0 in the .env to
+// turn the floor off. Default $50 = $0.50 per share.
+const MIN_CONTRACT_COST = (() => { const v = parseFloat(process.env.MIN_CONTRACT_COST); return Number.isFinite(v) && v >= 0 ? v : 50; })();
 // SAME-DAY TRIAL (2026-10-05, SMT/ICT test service only -- production's own
 // tradeEngine.js on main is separate and still uses 1): changed 1 -> 0 at the
 // user's request after a 90-day backtest (confirmed signals, 75% take-profit)
@@ -301,6 +306,14 @@ async function evaluateAndMaybeEnterSmc(symbol) {
       contract,
     };
   }
+  if (contractCost < MIN_CONTRACT_COST) {
+    return {
+      action: "skip",
+      reason: `${contract.symbol} costs only $${contractCost.toFixed(2)} per contract — below the $${MIN_CONTRACT_COST} minimum (too cheap: the buy/sell spread would eat the trade), skipping even though the signal looks valid.`,
+      signal: analysis.signal,
+      contract,
+    };
+  }
 
   const entryCostWithFee = +(contractCost + ENTRY_FEE).toFixed(2);
 
@@ -413,6 +426,13 @@ async function evaluateAndMaybeEnterSr(symbol, ctx = {}) {
     return {
       action: "skip",
       reason: `${contract.symbol} costs $${contractCost.toFixed(2)} per contract — above the $${MAX_CONTRACT_COST} cap, skipping even though the signal looks valid.`,
+      signal, contract,
+    };
+  }
+  if (contractCost < MIN_CONTRACT_COST) {
+    return {
+      action: "skip",
+      reason: `${contract.symbol} costs only $${contractCost.toFixed(2)} per contract — below the $${MIN_CONTRACT_COST} minimum (too cheap: the buy/sell spread would eat the trade), skipping even though the signal looks valid.`,
       signal, contract,
     };
   }
