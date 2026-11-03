@@ -145,6 +145,29 @@ async function rootsBoughtToday(alpacaClient, now = new Date()) {
   return roots;
 }
 
+// How many times we already bought each underlying today (New York date), and when the
+// latest one was entered. Used for the "N trades per symbol per day" rule + re-entry cooldown.
+// Same order-history source as rootsBoughtToday, so it survives restarts.
+// Returns Map(root -> { count, lastEntryMs }).
+async function tradesTodayByRoot(alpacaClient, now = new Date()) {
+  const today = nyParts(now).date;
+  const orders = await alpacaClient.getOrders({ status: "all", limit: 200 });
+  const out = new Map();
+  for (const o of orders || []) {
+    if (o.side !== "buy" || o.asset_class !== "us_option") continue;
+    if (["canceled", "rejected", "expired"].includes(o.status) && !o.filled_at) continue;
+    const when = o.filled_at || o.submitted_at || o.created_at;
+    if (!when || nyParts(when).date !== today) continue;
+    const parsed = alpacaClient.parseOccSymbol(o.symbol);
+    if (!parsed) continue;
+    const cur = out.get(parsed.root) || { count: 0, lastEntryMs: 0 };
+    cur.count += 1;
+    cur.lastEntryMs = Math.max(cur.lastEntryMs, new Date(when).getTime());
+    out.set(parsed.root, cur);
+  }
+  return out;
+}
+
 // The filled BUY order for an open option position -> { level info, enteredAtMs } or null.
 async function entryInfoForPosition(alpacaClient, optionSymbol) {
   const orders = await alpacaClient.getOrders({ status: "closed", limit: 20, symbols: optionSymbol });
@@ -160,5 +183,5 @@ module.exports = {
   completedSessionBars, isLevelBroken, findLiveSignal,
   makeClientOrderId, parseClientOrderId,
   isEodCloseTime, levelBreakSince,
-  getDailyBars, rootsBoughtToday, entryInfoForPosition,
+  getDailyBars, rootsBoughtToday, tradesTodayByRoot, entryInfoForPosition,
 };
