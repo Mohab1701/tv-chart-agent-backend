@@ -96,7 +96,10 @@ async function notify(title, message) {
 const SYMBOLS = ["NVDA", "TSLA", "NFLX", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "AMD"];
 const ENTRY_FEE = 3;
 const EXIT_FEE = 3;
-const MAX_CONTRACT_COST = 300; // skip a signal if the contract itself costs more than this (ask * 100), before fees
+// skip a signal if the contract itself costs more than this (ask * 100), before fees.
+// Raised from $300 to $400 on the smt-ict-version test branch (2026-11-03, at the user's request).
+// Override with MAX_CONTRACT_COST in the .env.
+const MAX_CONTRACT_COST = (() => { const v = parseFloat(process.env.MAX_CONTRACT_COST); return Number.isFinite(v) && v > 0 ? v : 400; })();
 // Floor on the same number: a contract this cheap (ask * 100 below the floor, before fees) is
 // mostly spread -- e.g. a $0.13 option that loses ~$13 just from buying at the ask and selling
 // at the bid. Skipped even when the signal looks valid. Set MIN_CONTRACT_COST=0 in the .env to
@@ -150,7 +153,10 @@ const CONTRACTS_PER_TRADE = 1; // 1 contract per company, for now — each symbo
 // hold ONE position at a time (two would need to total under $500
 // combined) -- that's intentional: it's what actually sizing for a $500
 // account looks like, not a bug.
-const SIMULATED_WALLET_SIZE = 500;
+// Raised from $500 to $1000 on the smt-ict-version test branch (2026-11-03, at the user's request),
+// so the comment above about "$500 / one position at a time" now applies at the new numbers.
+// Override with SIMULATED_WALLET_SIZE in the .env.
+const SIMULATED_WALLET_SIZE = (() => { const v = parseFloat(process.env.SIMULATED_WALLET_SIZE); return Number.isFinite(v) && v > 0 ? v : 1000; })();
 
 // The engine only runs when something external hits /run-cycle (GitHub
 // Actions, every 15 min during market hours). If one cycle runs late — a
